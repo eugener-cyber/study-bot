@@ -121,6 +121,11 @@ class Settings(BaseSettings):
         return value
 
 
+def _acceptance_type_error() -> int:
+    """Временно: проверка критерия «CI падает на ошибке типов» (Issue #1)."""
+    return "не число"
+
+
 def load_settings() -> Settings:
     """Собирает настройки. Отдельная функция, чтобы тесты подменяли окружение."""
     return Settings()  # type: ignore[call-arg]
