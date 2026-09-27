@@ -1,0 +1,65 @@
+# ТЗ §30.1: четыре контейнера и четыре тома.
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: studybot
+      POSTGRES_PASSWORD: studybot
+      POSTGRES_DB: studybot
+    volumes:
+      - ./data/pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studybot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ТЗ §2.2: локальный Bot API server ставится на этапе 1, даже пока поддержан
+  # только PDF. Публичный Bot API не отдаёт файлы больше 20 МБ, а переезд позже
+  # меняет способ получения файла во всех адаптерах сразу. См. docs/adr/0002.
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: 1
+    volumes:
+      - ./data/telegram-bot-api:/var/lib/telegram-bot-api
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8081 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://studybot:studybot@postgres:5432/studybot
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./data/materials:/app/data/materials
+      - ./data/assets:/app/data/assets
+      - ./data/backup:/app/data/backup
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      telegram-bot-api:
+        condition: service_healthy
+    restart: unless-stopped
