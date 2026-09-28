@@ -12,9 +12,10 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Annotated
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -38,8 +39,13 @@ class Settings(BaseSettings):
     TELEGRAM_API_HASH: str
     """api_hash оттуда же."""
 
-    ALLOWED_USER_IDS: list[int]
-    """Белый список (§1.3). Реальные Telegram id — персональные данные (§30.2)."""
+    ALLOWED_USER_IDS: Annotated[list[int], NoDecode]
+    """Белый список (§1.3). Реальные Telegram id — персональные данные (§30.2).
+
+    NoDecode обязателен: без него pydantic-settings пытается разобрать значение
+    переменной окружения как JSON ещё до валидаторов, и «111,222» падает
+    с SettingsError. Валидатор ниже разбирает строку сам.
+    """
 
     DATABASE_URL: str
     REDIS_URL: str
@@ -83,6 +89,7 @@ class Settings(BaseSettings):
     MIN_IMAGE_AREA_RATIO: float = 0.02
     NEW_FACT_DELAY_MIN: int = 10
     AWAITING_USER_TIMEOUT_H: int = 24
+    MAX_INTERVAL_DAYS: int = 180
     LANG_CONFIDENCE_MIN: float = 0.8
     COST_REESTIMATE_FACTOR: float = 1.5
 

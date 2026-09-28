@@ -37,7 +37,9 @@ services:
     volumes:
       - ./data/telegram-bot-api:/var/lib/telegram-bot-api
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 8081 || exit 1"]
+      # 127.0.0.1, а не localhost: внутри контейнера localhost резолвится
+      # в ::1, а сервер слушает только IPv4 — healthcheck падал бы всегда.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8081 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10

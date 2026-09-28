@@ -6,10 +6,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Исходники копируются ДО установки: pip install . собирает сам проект,
+# и setuptools ищет пакеты, перечисленные в [tool.setuptools]. Порядок
+# «сначала pyproject ради кеша слоёв» здесь не работает — сборка падает
+# с «package directory 'bot' does not exist».
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir .
-
 COPY bot ./bot
 COPY core ./core
+
+RUN pip install --no-cache-dir .
 
 CMD ["python", "-m", "bot.main"]
