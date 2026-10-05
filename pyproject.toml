@@ -1,0 +1,72 @@
+[project]
+name = "studybot"
+version = "0.1.0"
+description = "Telegram-бот: конспекты, задания и интервальное повторение по учебным материалам"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.15",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "redis>=5.2",
+    "structlog>=24.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.10",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-socket>=0.7",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["bot", "bot.middlewares", "bot.handlers", "core"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF"]
+# RUF001-003 ловят гомоглифы — кириллические буквы, неотличимые от латинских,
+# в преимущественно латинском коде. Проект сознательно русскоязычный:
+# комментарии, docstring и тексты для пользователя — на русском, и каждая
+# буква «с» или «е» даёт срабатывание. Правило не применимо, а не смягчено.
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+# ТЗ §35 требует mypy --strict на core/ — это нижняя граница, не верхняя.
+# Проверяется и bot/: прогон показал ноль ошибок, то есть строгость там ничего
+# не стоит. Прежнее обоснование («динамические типы aiogram дают поток
+# type: ignore») проверки не выдержало — ревью PR #3, FAIL 3.2.
+[tool.mypy]
+python_version = "3.12"
+files = ["core", "bot"]
+strict = true
+warn_unreachable = true
+
+# Тесты — вне строгой проверки: моки по природе возвращают Any, и строгость
+# на них даёт поток подавлений без пользы. Это не относится к bot/ и core/.
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# ТЗ §41.4: тест, требующий сети, в CI не участвует. Фильтр стоит здесь, а не
+# флагом в Makefile: иначе `make check` и прямой вызов `pytest` разойдутся, и
+# live-тест прошёл бы в одном из двух путей. CI вызывает ту же цель.
+addopts = ["-m", "not live"]
+markers = [
+    "live: тест, которому нужна сеть. Вводится §36, в CI не участвует по §41.4.",
+]

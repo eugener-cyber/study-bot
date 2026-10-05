@@ -1,0 +1,24 @@
+# Секреты — никогда в репозиторий
+.env
+.env.local
+*.pem
+*.key
+
+# Данные
+data/
+*.db
+
+# Python
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Прочее
+.DS_Store
