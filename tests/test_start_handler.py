@@ -15,11 +15,11 @@ from bot.handlers.start import (
     CONSENT_ACCEPTED,
     CONSENT_CALLBACK,
     GREETING,
-    NOT_MODIFIED,
     consent_keyboard,
     handle_consent,
     handle_start,
 )
+from tests.test_dispatcher import TELEGRAM_NOT_MODIFIED
 
 
 def _message(text: str | None = None) -> Message:
@@ -48,9 +48,14 @@ def _callback(inner: Message) -> CallbackQuery:
 
 
 def _not_modified() -> TelegramBadRequest:
+    """Ошибка Telegram с дословным текстом, а не собранным из константы кода.
+
+    См. `TELEGRAM_NOT_MODIFIED`: фейк, построенный из той же константы, что
+    проверяет рабочий код, самосогласован при любом её значении.
+    """
     return TelegramBadRequest(
         method=EditMessageText(text=CONSENT_ACCEPTED, chat_id=1, message_id=1),
-        message=f"Bad Request: {NOT_MODIFIED}",
+        message=TELEGRAM_NOT_MODIFIED,
     )
 
 

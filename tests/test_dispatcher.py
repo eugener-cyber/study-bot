@@ -26,12 +26,26 @@ from aiogram.types import CallbackQuery, Chat, InlineQuery, Message, PhotoSize, 
 
 from bot.errors import SAFE_REPLY
 from bot.handlers.fallback import REPLY
-from bot.handlers.start import CONSENT_CALLBACK, GREETING, NOT_MODIFIED
+from bot.handlers.start import CONSENT_CALLBACK, GREETING
 from bot.main import build_dispatcher
 from core.config import Settings
 
 ALLOWED_ID = 111
 OUTSIDER_ID = 999
+
+TELEGRAM_NOT_MODIFIED = (
+    "Bad Request: message is not modified: specified new message content and reply "
+    "markup are exactly the same as a current content and reply markup of the message"
+)
+"""Ответ Telegram при правке сообщения на тот же текст — дословно.
+
+Записан литералом, а не взят из `bot.handlers.start.NOT_MODIFIED`. Иначе фейк и
+рабочий код строятся из одной константы, пара самосогласованна при любом её
+значении, и расхождение константы с реальностью никакой тест не заметит —
+вернулся бы FAIL 2.2: пользователь видит «Что-то пошло не так» на успешно
+принятом согласии. Проверяющий показал это, подменив константу: прогон остался
+зелёным.
+"""
 
 
 class RecordingSession(BaseSession):
@@ -40,6 +54,7 @@ class RecordingSession(BaseSession):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[TelegramMethod[Any]] = []
+        self.not_modified_collisions = 0
         self._edited: dict[tuple[Any, Any], str] = {}
 
     async def close(self) -> None:
@@ -54,7 +69,8 @@ class RecordingSession(BaseSession):
             # Без этого двойное нажатие в тесте проходит, а в чате даёт сбой.
             key = (method.chat_id, method.message_id)
             if self._edited.get(key) == method.text:
-                raise TelegramBadRequest(method=method, message=f"Bad Request: {NOT_MODIFIED}")
+                self.not_modified_collisions += 1
+                raise TelegramBadRequest(method=method, message=TELEGRAM_NOT_MODIFIED)
             self._edited[key] = method.text or ""
             return True
         if isinstance(method, SendMessage):
@@ -342,8 +358,13 @@ async def test_double_consent_click_shows_no_failure() -> None:
     await dispatcher.feed_update(bot, _consent_update(ALLOWED_ID, 10))
     await dispatcher.feed_update(bot, _consent_update(ALLOWED_ID, 11))
 
-    assert SAFE_REPLY not in session.replies()
+    # Положительный ассерт: столкновение действительно произошло. Остальные
+    # проверки имеют форму «плохого не случилось» и выполняются, когда опасная
+    # ситуация просто не возникла — Проверяющий отключил воспроизведение
+    # ошибки в фейке и получил зелёный прогон.
+    assert session.not_modified_collisions == 1, "столкновения не было, тест пустой"
     assert sum(isinstance(c, EditMessageText) for c in session.calls) == 2
+    assert SAFE_REPLY not in session.replies()
 
 
 async def test_safe_reply_leaks_nothing() -> None:
