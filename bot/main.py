@@ -77,6 +77,13 @@ def build_dispatcher(settings: Settings, redis: Redis) -> Dispatcher:
 
 
 async def run() -> None:
+    """Поднимает бота и ведёт поллинг до остановки процесса.
+
+    Ничего не возвращает и выходит только при остановке поллинга. Соединения
+    закрываются в `finally`, включая аварийный выход: иначе при рестарте
+    остаётся висящий `getUpdates`, и Telegram отвечает новому процессу
+    конфликтом.
+    """
     configure_logging()
     settings = load_settings()
 

@@ -35,10 +35,26 @@ def test_short_field_untouched() -> None:
 
 
 def test_service_fields_not_truncated() -> None:
-    """Усекать error или stage вредно — они и нужны целиком."""
-    long_error = "E" * 500
-    result = truncate_user_content(None, "info", {"error": long_error})
-    assert result["error"] == long_error
+    """Усекать имя стадии или класс ошибки вредно — они нужны целиком."""
+    long_value = "E" * 500
+    result = truncate_user_content(None, "info", {"stage": long_value})
+    assert result["stage"] == long_value
+
+
+def test_error_message_is_truncated() -> None:
+    """Текст исключения — пользовательское содержимое, а не диагностика.
+
+    До ревью фазы 2 поле `error` стояло в перечне исключений и сохранялось
+    целиком. Сообщения исключений штатно содержат входные данные, а
+    `error=str(exc)` — самая естественная запись в коде. Класс ошибки
+    логируется как `error_type` и остаётся целым.
+    """
+    long_message = "invalid literal for int(): " + "9" * 300
+    result = truncate_user_content(
+        None, "info", {"error": long_message, "error_type": "ValueError"}
+    )
+    assert len(result["error"]) == TRUNCATE_AT
+    assert result["error_type"] == "ValueError"
 
 
 def test_limit_is_eighty_as_required_by_spec() -> None:
@@ -70,8 +86,9 @@ def test_unlisted_field_is_truncated() -> None:
 
 def test_service_fields_listed_explicitly() -> None:
     """Перечень исключений закрытый и содержит только служебные имена."""
-    for field in ("event", "level", "timestamp", "error", "exception"):
+    for field in ("event", "level", "timestamp", "error_type", "exception"):
         assert field in NEVER_TRUNCATED
+    assert "error" not in NEVER_TRUNCATED, "текст исключения обязан усекаться"
     for field in ("text", "statement", "answer", "question", "material_text"):
         assert field not in NEVER_TRUNCATED
 
