@@ -7,8 +7,8 @@ import logging
 import structlog
 
 from core.logging import (
+    NEVER_TRUNCATED,
     TRUNCATE_AT,
-    TRUNCATED_FIELDS,
     configure_logging,
     get_logger,
     truncate_user_content,
@@ -41,9 +41,39 @@ def test_service_fields_not_truncated() -> None:
     assert result["error"] == long_error
 
 
-def test_truncated_fields_cover_user_content() -> None:
-    for field in ("text", "statement", "answer", "question"):
-        assert field in TRUNCATED_FIELDS
+def test_limit_is_eighty_as_required_by_spec() -> None:
+    """§31 называет число буквально: «максимум первые 80 символов».
+
+    Остальные тесты выражены через `TRUNCATE_AT` и поэтому проходят при любом
+    его значении — проверено, с 200 они тоже зелёные. Норму держит только этот
+    ассерт, и он здесь единственный, где 80 стоит литералом.
+    """
+    assert TRUNCATE_AT == 80
+
+
+def test_unlisted_field_is_truncated() -> None:
+    """Любое неизвестное поле считается пользовательским содержимым.
+
+    Это главное свойство схемы «запрещено по умолчанию»: с прежним перечнем
+    усекаемых полей `answer_text` уезжал в лог целиком, потому что в список
+    попал `answer`, а не `answer_text`.
+    """
+    long_text = "ю" * 300
+    result = truncate_user_content(
+        None,
+        "info",
+        {"answer_text": long_text, "question_text": long_text, "note": long_text},
+    )
+    for key in ("answer_text", "question_text", "note"):
+        assert len(result[key]) == TRUNCATE_AT, f"{key} не усечено"
+
+
+def test_service_fields_listed_explicitly() -> None:
+    """Перечень исключений закрытый и содержит только служебные имена."""
+    for field in ("event", "level", "timestamp", "error", "exception"):
+        assert field in NEVER_TRUNCATED
+    for field in ("text", "statement", "answer", "question", "material_text"):
+        assert field not in NEVER_TRUNCATED
 
 
 def test_get_logger_type_matches_annotation() -> None:
