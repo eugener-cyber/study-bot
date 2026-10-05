@@ -10,6 +10,10 @@
 которых иначе запускает обработку материала заново и расходует бюджет §6.3.
 
 Троттлер §17.3 на исходящие сообщения — другой механизм, вводится в §17.
+
+Регистрируется outer middleware на `Update`, а не на отдельных обсерверах —
+см. `bot/main.py`. Поэтому ответ пользователю идёт через `bot.notify`: у
+`Update` метода `answer` нет.
 """
 
 from __future__ import annotations
@@ -18,9 +22,10 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import BaseMiddleware
-from aiogram.types import Message, TelegramObject, User
+from aiogram.types import TelegramObject, User
 from redis.asyncio import Redis
 
+from bot.notify import notify
 from core.logging import get_logger
 
 log = get_logger(__name__)
@@ -53,8 +58,7 @@ class ThrottleMiddleware(BaseMiddleware):
             # иначе зажатая кнопка превратится в поток предупреждений.
             if count == self._limit + 1:
                 log.info("throttled", user_id=user.id, count=count)
-                if isinstance(event, Message):
-                    await event.answer(WARNING)
+                await notify(event, WARNING)
             return None
 
         return await handler(event, data)

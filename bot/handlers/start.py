@@ -16,7 +16,6 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from core.logging import get_logger
 
 log = get_logger(__name__)
-router = Router(name="start")
 
 CONSENT_CALLBACK = "consent:accept"
 
@@ -43,14 +42,12 @@ def consent_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-@router.message(CommandStart())
 async def handle_start(message: Message) -> None:
     """Приветствие и запрос согласия."""
     log.info("start_command", user_id=message.from_user.id if message.from_user else None)
     await message.answer(GREETING, reply_markup=consent_keyboard())
 
 
-@router.callback_query(F.data == CONSENT_CALLBACK)
 async def handle_consent(callback: CallbackQuery) -> None:
     """Обрабатывает нажатие кнопки согласия.
 
@@ -65,3 +62,18 @@ async def handle_consent(callback: CallbackQuery) -> None:
     await callback.answer()
     if isinstance(callback.message, Message):
         await callback.message.edit_text(CONSENT_ACCEPTED)
+
+
+def build_start_router() -> Router:
+    """Роутер `/start` и согласия.
+
+    Фабрика, а не модульный `Router`: aiogram запрещает присоединять один
+    роутер дважды, и с объектом уровня модуля второй вызов `build_dispatcher`
+    в том же процессе падал `RuntimeError: Router is already attached`. Из-за
+    этого сборка диспетчера была непроверяемой by construction — ревью PR #3,
+    FAIL 4.3. `build_fallback_router` имел эту форму с самого начала.
+    """
+    router = Router(name="start")
+    router.message.register(handle_start, CommandStart())
+    router.callback_query.register(handle_consent, F.data == CONSENT_CALLBACK)
+    return router

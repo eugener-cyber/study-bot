@@ -1,0 +1,272 @@
+"""Сборка диспетчера: порядок слоёв и покрытие всех типов апдейтов.
+
+Каждый middleware проверен в изоляции в своём файле. Здесь проверяется то, что
+из них собрано, — и до ревью PR #3 этого не проверял никто. Проверяющий показал
+мутациями: перевёрнутый порядок middleware и роутер-перехватчик, включённый
+раньше `/start`, оставляли прогон зелёным (74 passed в обоих случаях).
+
+Тесты идут через `Dispatcher.feed_update`, то есть через ту же точку, в которую
+попадает настоящий апдейт из поллинга. Сеть не нужна: исходящие вызовы
+перехватывает `RecordingSession`.
+"""
+
+from __future__ import annotations
+
+import datetime
+from collections.abc import AsyncGenerator
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+from aiogram import Bot, Dispatcher, Router
+from aiogram.client.session.base import BaseSession
+from aiogram.methods import AnswerCallbackQuery, SendMessage, TelegramMethod
+from aiogram.types import Chat, InlineQuery, Message, PhotoSize, Update, User
+
+from bot.errors import SAFE_REPLY
+from bot.handlers.fallback import REPLY
+from bot.handlers.start import GREETING
+from bot.main import build_dispatcher
+from core.config import Settings
+
+ALLOWED_ID = 111
+OUTSIDER_ID = 999
+
+
+class RecordingSession(BaseSession):
+    """Сессия, которая ничего не отправляет и всё записывает."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[TelegramMethod[Any]] = []
+
+    async def close(self) -> None:
+        return None
+
+    async def make_request(
+        self, bot: Bot, method: TelegramMethod[Any], timeout: int | None = None
+    ) -> Any:
+        self.calls.append(method)
+        if isinstance(method, SendMessage):
+            return Message(
+                message_id=2,
+                date=datetime.datetime(2026, 1, 1),
+                chat=Chat(id=1, type="private"),
+            )
+        return True
+
+    async def stream_content(
+        self,
+        url: str,
+        headers: dict[str, Any] | None = None,
+        timeout: int = 30,
+        chunk_size: int = 65536,
+        raise_for_status: bool = True,
+    ) -> AsyncGenerator[bytes, None]:
+        yield b""
+
+    def texts(self) -> list[str]:
+        return [c.text for c in self.calls if isinstance(c, SendMessage)]
+
+
+def _settings() -> Settings:
+    return Settings(  # type: ignore[arg-type]
+        _env_file=None,
+        BOT_TOKEN="0000000000:X",
+        TELEGRAM_API_ID="1",
+        TELEGRAM_API_HASH="h" * 32,
+        ALLOWED_USER_IDS=str(ALLOWED_ID),
+        DATABASE_URL="postgresql+asyncpg://t:t@localhost/t",
+        REDIS_URL="redis://localhost:6379/0",
+        TZ_DEFAULT="Europe/Moscow",
+        LLM_PROVIDER="manual",
+    )
+
+
+def _redis() -> AsyncMock:
+    """Redis, который устраивает и RedisStorage, и троттлинг, и кулдаун."""
+    redis = AsyncMock()
+    redis.get = AsyncMock(return_value=None)
+    redis.set = AsyncMock(return_value=True)
+    pipe = AsyncMock()
+    pipe.incr = lambda *a, **k: None
+    pipe.expire = lambda *a, **k: None
+    pipe.execute = AsyncMock(return_value=[1, True])
+    redis.pipeline = lambda *a, **k: pipe
+    return redis
+
+
+def _bot() -> tuple[Bot, RecordingSession]:
+    session = RecordingSession()
+    return Bot(token="0000000000:TEST-TOKEN-NOT-REAL-0000000000000", session=session), session
+
+
+def _message_update(user_id: int, **extra: Any) -> Update:
+    return Update(
+        update_id=1,
+        message=Message(
+            message_id=1,
+            date=datetime.datetime(2026, 1, 1),
+            chat=Chat(id=user_id, type="private"),
+            from_user=User(id=user_id, is_bot=False, first_name="T"),
+            **extra,
+        ),
+    )
+
+
+def _inline_update(user_id: int) -> Update:
+    return Update(
+        update_id=2,
+        inline_query=InlineQuery(
+            id="q1",
+            from_user=User(id=user_id, is_bot=False, first_name="T"),
+            query="что-нибудь",
+            offset="",
+        ),
+    )
+
+
+async def test_start_is_answered_for_allowed_user() -> None:
+    bot, session = _bot()
+    dispatcher = build_dispatcher(_settings(), _redis())
+
+    await dispatcher.feed_update(bot, _message_update(ALLOWED_ID, text="/start"))
+
+    assert session.texts() == [GREETING]
+
+
+async def test_fallback_router_does_not_swallow_start() -> None:
+    """Порядок роутеров: перехватчик §19.4 включён последним.
+
+    Проверяющий включил его первым — прогон остался зелёным, хотя `/start`
+    перестал работать. Ассерт на точный текст это ловит.
+    """
+    bot, session = _bot()
+    dispatcher = build_dispatcher(_settings(), _redis())
+
+    await dispatcher.feed_update(bot, _message_update(ALLOWED_ID, text="/start"))
+
+    assert REPLY not in session.texts()
+
+
+async def test_unsupported_input_reaches_fallback() -> None:
+    bot, session = _bot()
+    dispatcher = build_dispatcher(_settings(), _redis())
+    photo = [PhotoSize(file_id="f", file_unique_id="u", width=1, height=1)]
+
+    await dispatcher.feed_update(bot, _message_update(ALLOWED_ID, photo=photo))
+
+    assert session.texts() == [REPLY]
+
+
+async def test_outsider_gets_nothing_at_all() -> None:
+    """Единственный критерий приёмки, который проверялся только вручную."""
+    bot, session = _bot()
+    dispatcher = build_dispatcher(_settings(), _redis())
+
+    await dispatcher.feed_update(bot, _message_update(OUTSIDER_ID, text="/start"))
+
+    assert session.calls == []
+
+
+async def test_outsider_is_rejected_before_throttle_counter() -> None:
+    """Порядок middleware: auth раньше throttle.
+
+    Считать обращения постороннего не нужно — он отклонён раньше. Если слои
+    поменять местами, счётчик в Redis начнёт расти от чужих обращений.
+    """
+    bot, _ = _bot()
+    redis = _redis()
+    dispatcher = build_dispatcher(_settings(), redis)
+    touched: list[str] = []
+    redis.pipeline = lambda *a, **k: touched.append("pipeline")  # type: ignore[assignment]
+
+    await dispatcher.feed_update(bot, _message_update(OUTSIDER_ID, text="привет"))
+
+    assert touched == []
+
+
+async def test_whitelist_covers_update_types_without_handlers_today() -> None:
+    """Белый список действует на любой тип апдейта, а не на два из них.
+
+    До ревью auth стоял на обсерверах `message` и `callback_query`. Здесь
+    хендлер для `inline_query` регистрируется уже после сборки — как это и
+    произойдёт в следующих пакетах — и проверяется, что он не вызывается для
+    постороннего и вызывается для своего.
+    """
+    bot, _ = _bot()
+    dispatcher = build_dispatcher(_settings(), _redis())
+    seen: list[int] = []
+
+    probe = Router(name="probe")
+
+    async def handle_probe(query: InlineQuery) -> None:
+        seen.append(query.from_user.id)
+
+    probe.inline_query.register(handle_probe)
+    dispatcher.include_router(probe)
+
+    await dispatcher.feed_update(bot, _inline_update(OUTSIDER_ID))
+    assert seen == [], "посторонний дошёл до хендлера нового типа апдейта"
+
+    await dispatcher.feed_update(bot, _inline_update(ALLOWED_ID))
+    assert seen == [ALLOWED_ID], "свой не дошёл до хендлера нового типа апдейта"
+
+
+async def test_fsm_failure_still_answers_user() -> None:
+    """Сбой Redis при резолвинге FSM — пользователь получает сообщение (§31).
+
+    Это воспроизведение дефекта FAIL 2.1. Прежний перехватчик был inner
+    middleware обсервера и вызывался после `FSMContextMiddleware`, поэтому
+    падение Redis давало пользователю тишину. Redis перезапускается штатно,
+    и тишина в эти секунды — ровно та картина, из-за которой пришлось вводить
+    переходный §19.4.
+    """
+    bot, session = _bot()
+    redis = _redis()
+    redis.get = AsyncMock(side_effect=ConnectionError("redis down"))
+    dispatcher = build_dispatcher(_settings(), redis)
+
+    await dispatcher.feed_update(bot, _message_update(ALLOWED_ID, text="/start"))
+
+    assert session.texts() == [SAFE_REPLY]
+
+
+async def test_handler_failure_still_answers_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Падение в самом хендлере — тот же безопасный ответ."""
+    import bot.handlers.start as start_module
+
+    async def boom(_message: Message) -> None:
+        raise RuntimeError("хендлер сломался")
+
+    monkeypatch.setattr(start_module, "handle_start", boom)
+
+    bot_obj, session = _bot()
+    dispatcher = build_dispatcher(_settings(), _redis())
+
+    await dispatcher.feed_update(bot_obj, _message_update(ALLOWED_ID, text="/start"))
+
+    assert session.texts() == [SAFE_REPLY]
+
+
+async def test_safe_reply_leaks_nothing() -> None:
+    assert "Traceback" not in SAFE_REPLY
+    assert "Error" not in SAFE_REPLY
+
+
+def test_dispatcher_can_be_built_twice() -> None:
+    """Фабрики роутеров вместо модульных объектов (FAIL 4.3).
+
+    С `router = Router(...)` на уровне модуля второй вызов падал
+    `RuntimeError: Router is already attached`, и всё выше было невозможно.
+    """
+    first = build_dispatcher(_settings(), _redis())
+    second = build_dispatcher(_settings(), _redis())
+    assert isinstance(first, Dispatcher) and isinstance(second, Dispatcher)
+    assert first is not second
+
+
+def test_answer_callback_query_is_a_known_method() -> None:
+    """Страховка от переименования метода в aiogram: `RecordingSession` молча
+    вернула бы True, и тесты на callback стали бы бессмысленными."""
+    assert issubclass(AnswerCallbackQuery, TelegramMethod)
