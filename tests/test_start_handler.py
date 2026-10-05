@@ -81,3 +81,12 @@ def test_todo_points_at_wp02_issue() -> None:
 def test_keyboard_has_single_button() -> None:
     keyboard = consent_keyboard().inline_keyboard
     assert len(keyboard) == 1 and len(keyboard[0]) == 1
+
+
+def test_consent_does_not_invite_to_send_material() -> None:
+    """§19.4: приглашать прислать материал нельзя, пока бот его не принимает.
+
+    Текст согласия заканчивался словами «Пришлите первый материал», а
+    обработчика для файлов не было — молчание после приглашения.
+    """
+    assert "ришлите" not in CONSENT_ACCEPTED

@@ -18,7 +18,7 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.fsm.storage.redis import RedisStorage
 from redis.asyncio import Redis
 
-from bot.handlers import start
+from bot.handlers import fallback, start
 from bot.middlewares.auth import AuthMiddleware
 from bot.middlewares.errors import ErrorsMiddleware
 from bot.middlewares.throttle import ThrottleMiddleware
@@ -50,6 +50,10 @@ def build_dispatcher(settings: Settings, redis: Redis) -> Dispatcher:
         )
 
     dispatcher.include_router(start.router)
+    # Последним: ловит всё, что не разобрали хендлеры выше (§19.4, переходное).
+    dispatcher.include_router(
+        fallback.build_fallback_router(redis, settings.UNSUPPORTED_REPLY_COOLDOWN_SEC)
+    )
     return dispatcher
 
 

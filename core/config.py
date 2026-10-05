@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     NEW_FACT_DELAY_MIN: int = 10
     AWAITING_USER_TIMEOUT_H: int = 24
     MAX_INTERVAL_DAYS: int = 180
+    UNSUPPORTED_REPLY_COOLDOWN_SEC: int = 60
     LANG_CONFIDENCE_MIN: float = 0.8
     COST_REESTIMATE_FACTOR: float = 1.5
 
