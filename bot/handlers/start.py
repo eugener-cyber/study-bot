@@ -45,6 +45,13 @@ CONSENT_ACCEPTED = (
 
 
 def consent_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура с единственной кнопкой принятия согласия.
+
+    Возвращает разметку с одной inline-кнопкой, `callback_data` которой равна
+    `CONSENT_CALLBACK`. Кнопка одна сознательно: отказ выражается тем, что
+    человек её не нажимает, а отдельная кнопка «не согласен» потребовала бы
+    экрана, на котором бот объясняет, что без согласия работать не может.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Согласен, начнём", callback_data=CONSENT_CALLBACK)]
