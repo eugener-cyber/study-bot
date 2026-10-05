@@ -23,8 +23,14 @@ RENAMED = {
     "NEW_FACT_DELAY": "NEW_FACT_DELAY_MIN",
 }
 
-# Значения, которые в ТЗ не числа и потому сверяются отдельно.
-NON_NUMERIC = {"MAX_SECTION_TOKENS", "COST_WARN_THRESHOLD", "COST_CURRENCY"}
+# Значения, которые в ТЗ действительно не числа.
+# `COST_WARN_THRESHOLD` — `TODO(owner)`, выводится после спайка (§34.1).
+# `COST_CURRENCY` — `USD` на этапе 1, `RUB` в эксплуатации.
+# `MAX_SECTION_TOKENS` стоял здесь ошибочно: в ТЗ «60000 на claude-opus-5
+# (окно 1M), уточняется при смене провайдера» — число есть, и разбор берёт
+# его первым. Самый дорогой по последствиям порог §30.3 был исключён из
+# сверки без причины (ревью PR #3, FAIL 3.3).
+NON_NUMERIC = {"COST_WARN_THRESHOLD", "COST_CURRENCY"}
 
 
 def _spec_thresholds() -> dict[str, str]:
@@ -49,9 +55,45 @@ def _spec_thresholds() -> dict[str, str]:
     return found
 
 
+def _spec_row_names() -> list[str]:
+    """Имена из первой колонки §30.3 — независимо от разбора значений.
+
+    Намеренно проще `_spec_thresholds`: та разносит парные строки по значениям
+    и может их потерять, а эта только перечисляет имена.
+    """
+    text = SPEC.read_text(encoding="utf-8")
+    block = text.split("## 30.3")[1].split("\n# ")[0]
+    names: list[str] = []
+    for line in block.splitlines():
+        if line.startswith("| `"):
+            names += re.findall(r"`([A-Z_]{3,})`", line.strip("|").split("|")[0])
+    return names
+
+
+def _spec_required_names() -> set[str]:
+    """Обязательные переменные §30.2 из блока кода."""
+    text = SPEC.read_text(encoding="utf-8")
+    block = text.split("## 30.2")[1].split("## 30.3")[0]
+    fenced = block.split("```")[1]
+    return set(re.findall(r"\b([A-Z][A-Z_]{2,})\b", fenced))
+
+
 def test_spec_table_is_readable() -> None:
-    """Если разбор сломался, остальные проверки стали бы бессмысленно зелёными."""
-    assert len(_spec_thresholds()) >= 26
+    """Если разбор сломался, остальные проверки стали бы бессмысленно зелёными.
+
+    Здесь стояло `>= 26`, тогда как разбор видит 30: потеря четырёх строк
+    оставляла тест зелёным (ревью PR #3). Число больше не берётся из памяти о
+    прошлой редакции — оно сверяется с независимым разбором первой колонки.
+    """
+    parsed = _spec_thresholds()
+    assert parsed, "таблица §30.3 не разобралась вовсе"
+    assert sorted(parsed) == sorted(
+        _spec_row_names()
+    ), "разбор значений потерял или добавил имена относительно первой колонки"
+    # Непустота не доказывает, что разбор дошёл до конца таблицы: три опорных
+    # имени взяты из начала, середины и конца §30.3.
+    for anchor in ("MIN_FACT_CONFIDENCE", "MIN_PUSH_INTERVAL", "LANG_CONFIDENCE_MIN"):
+        assert anchor in parsed, f"разбор не дошёл до {anchor}"
 
 
 def test_no_threshold_missing_from_config() -> None:
@@ -63,6 +105,22 @@ def test_no_threshold_missing_from_config() -> None:
         if RENAMED.get(name, name) not in fields
     }
     assert not missing, f"Пороги есть в §30.3, но нет в конфиге: {sorted(missing)}"
+
+
+def test_no_config_field_missing_from_spec() -> None:
+    """Обратное направление: поле появилось в конфиге — оно обязано быть в ТЗ.
+
+    План обещал проверку «или наоборот», но реализовано было только одно
+    направление: Проверяющий добавил в Settings поле `INVENTED_THRESHOLD`, и
+    прогон остался зелёным (ревью PR #3, FAIL 4.4). Смысл направления виден
+    на этом же пакете: `MAX_INTERVAL_DAYS` и `UNSUPPORTED_REPLY_COOLDOWN_SEC`
+    пришли через change request, и эта проверка не дала бы добавить порог в
+    конфиг, забыв про спецификацию.
+    """
+    documented = {RENAMED.get(name, name) for name in _spec_thresholds()}
+    documented |= _spec_required_names()
+    extra = set(Settings.model_fields) - documented
+    assert not extra, f"Поля есть в конфиге, но не описаны в §30.2 и §30.3: {sorted(extra)}"
 
 
 @pytest.mark.parametrize("name,raw", sorted(_spec_thresholds().items()))
