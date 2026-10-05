@@ -11,13 +11,15 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 
 import pytest
 from pytest_socket import disable_socket, enable_socket
 
 ENV_STUB = {
+    # Обязательные переменные §30.2 фиктивными значениями: без них Settings
+    # валится на старте. Используется `_from_env` в `test_config.py` — путь
+    # через настоящее окружение, а не через аргументы конструктора.
     "BOT_TOKEN": "0000000000:TEST-TOKEN-NOT-REAL-0000000000000",
     "TELEGRAM_API_ID": "1",
     "TELEGRAM_API_HASH": "00000000000000000000000000000000",
@@ -41,18 +43,3 @@ def _no_network(request: pytest.FixtureRequest) -> Iterator[None]:
     disable_socket(allow_unix_socket=True)
     yield
     enable_socket()
-
-
-@pytest.fixture
-def env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Подставляет обязательные переменные §30.2 фиктивными значениями.
-
-    Без этого Settings валится на старте — и это правильное поведение, но в
-    тестах нам нужно проверять не его, а то, что идёт дальше.
-    """
-    monkeypatch.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    for key, value in ENV_STUB.items():
-        monkeypatch.setenv(key, value)
-    # .env рядом с репозиторием не должен влиять на тесты.
-    monkeypatch.setenv("BOT_TOKEN", ENV_STUB["BOT_TOKEN"])
-    yield

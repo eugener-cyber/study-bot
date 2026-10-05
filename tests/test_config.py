@@ -8,21 +8,17 @@ import pytest
 from pydantic import ValidationError
 
 from core.config import Settings
+from tests.conftest import ENV_STUB
 
 
 def _settings(**overrides: str) -> Settings:
-    base = {
-        "BOT_TOKEN": "0000000000:X",
-        "TELEGRAM_API_ID": "1",
-        "TELEGRAM_API_HASH": "h" * 32,
-        "ALLOWED_USER_IDS": "111,222",
-        "DATABASE_URL": "postgresql+asyncpg://t:t@localhost/t",
-        "REDIS_URL": "redis://localhost:6379/0",
-        "TZ_DEFAULT": "Europe/Moscow",
-        "LLM_PROVIDER": "manual",
-    }
-    base.update(overrides)
-    return Settings(_env_file=None, **base)  # type: ignore[arg-type]
+    """Собирает Settings аргументами конструктора — путь, минующий окружение.
+
+    Сохранён намеренно: он удобен для проверки валидаторов. Но именно потому,
+    что все 58 тестов пакета шли только через него, пропала необходимость
+    `NoDecode` у `ALLOWED_USER_IDS` — см. блок ниже.
+    """
+    return Settings(_env_file=None, **{**ENV_STUB, **overrides})  # type: ignore[arg-type]
 
 
 def test_missing_required_variable_names_it() -> None:
@@ -72,18 +68,13 @@ def test_cost_warn_threshold_is_decimal() -> None:
 
 
 def _from_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> Settings:
-    env = {
-        "BOT_TOKEN": "0000000000:X",
-        "TELEGRAM_API_ID": "1",
-        "TELEGRAM_API_HASH": "h" * 32,
-        "ALLOWED_USER_IDS": "111,222",
-        "DATABASE_URL": "postgresql+asyncpg://t:t@localhost/t",
-        "REDIS_URL": "redis://localhost:6379/0",
-        "TZ_DEFAULT": "Europe/Moscow",
-        "LLM_PROVIDER": "manual",
-    }
-    env.update(overrides)
-    for key, value in env.items():
+    """Собирает Settings через настоящее окружение, а не через kwargs.
+
+    Значения берутся из `ENV_STUB` в `conftest.py`, а не повторяются здесь:
+    при удалении мёртвой фикстуры `env` (ревью PR #3, FAIL 5.1) выяснилось,
+    что этот словарь был её вторым экземпляром.
+    """
+    for key, value in {**ENV_STUB, **overrides}.items():
         monkeypatch.setenv(key, value)
     return Settings(_env_file=None)  # type: ignore[call-arg]
 
