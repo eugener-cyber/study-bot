@@ -238,6 +238,43 @@ async def test_whitelist_covers_update_types_without_handlers_today() -> None:
     assert seen == [ALLOWED_ID], "свой не дошёл до хендлера нового типа апдейта"
 
 
+@pytest.mark.parametrize(
+    "user_id,redis_broken,expected",
+    [
+        (ALLOWED_ID, False, [GREETING]),
+        (ALLOWED_ID, True, [SAFE_REPLY]),
+        (OUTSIDER_ID, False, []),
+        (OUTSIDER_ID, True, []),
+    ],
+    ids=["свой-норма", "свой-сбой", "посторонний-норма", "посторонний-сбой"],
+)
+async def test_who_and_what_broke_are_crossed(
+    user_id: int, redis_broken: bool, expected: list[str]
+) -> None:
+    """Два измерения перекрещены: кто обратился и что сломалось.
+
+    Ревью фазы 2 нашло дефект, внесённый правкой FAIL 2.1: перехватчик ошибок
+    на наблюдателе `errors` стоит снаружи цепочки middleware, то есть снаружи
+    `AuthMiddleware`, и отвечал постороннему при любом сбое до авторизации.
+    Прежние тесты этого не ловили, потому что проверяли измерения по
+    отдельности: сбой — только для своего, постороннего — только при здоровом
+    Redis. Четвёртая клетка таблицы не проверялась никем.
+
+    Случай «посторонний-сбой» достижим снаружи: Redis перезапускается штатно,
+    и посторонний, пишущий боту регулярно, получал в эти секунды
+    подтверждение, что адресат живой, — ровно то, что §1.3 запрещает.
+    """
+    bot, session = _bot()
+    redis = _redis()
+    if redis_broken:
+        redis.get = AsyncMock(side_effect=ConnectionError("redis down"))
+    dispatcher = build_dispatcher(_settings(), redis)
+
+    await dispatcher.feed_update(bot, _message_update(user_id, text="/start"))
+
+    assert session.replies() == expected
+
+
 async def test_fsm_failure_still_answers_user() -> None:
     """Сбой Redis при резолвинге FSM — пользователь получает сообщение (§31).
 

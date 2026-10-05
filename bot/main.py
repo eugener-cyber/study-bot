@@ -18,7 +18,7 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.fsm.storage.redis import RedisStorage
 from redis.asyncio import Redis
 
-from bot.errors import handle_error
+from bot.errors import build_error_handler
 from bot.handlers import fallback, start
 from bot.middlewares.auth import AuthMiddleware
 from bot.middlewares.throttle import ThrottleMiddleware
@@ -54,7 +54,10 @@ def build_dispatcher(settings: Settings, redis: Redis) -> Dispatcher:
     """
     dispatcher = Dispatcher(storage=RedisStorage(redis=redis))
 
-    dispatcher.errors.register(handle_error)
+    # Белый список передаётся и сюда: наблюдатель `errors` стоит снаружи
+    # цепочки middleware, то есть снаружи AuthMiddleware. Без этого бот
+    # отвечал бы постороннему при любом сбое до авторизации (§1.3).
+    dispatcher.errors.register(build_error_handler(settings.ALLOWED_USER_IDS))
 
     dispatcher.update.outer_middleware(AuthMiddleware(settings.ALLOWED_USER_IDS))
     dispatcher.update.outer_middleware(

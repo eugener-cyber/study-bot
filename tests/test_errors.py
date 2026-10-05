@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 from aiogram.types import CallbackQuery, Chat, ErrorEvent, Message, Update, User
 
-from bot.errors import SAFE_REPLY, handle_error
+from bot.errors import SAFE_REPLY, ErrorHandler, build_error_handler
 from bot.notify import notify, respondable
 
 
@@ -22,13 +22,21 @@ def _message() -> Message:
     return message
 
 
+ALLOWED_ID = 111
+OUTSIDER_ID = 999
+
+
 def _error_event(update: Update) -> ErrorEvent:
     return ErrorEvent(update=update, exception=RuntimeError("что-то сломалось"))
 
 
+def _handler(allowed: list[int] | None = None) -> ErrorHandler:
+    return build_error_handler([ALLOWED_ID] if allowed is None else allowed)
+
+
 async def test_user_is_notified_on_message_update() -> None:
     message = _message()
-    assert await handle_error(_error_event(Update(update_id=1, message=message))) is True
+    assert await _handler()(_error_event(Update(update_id=1, message=message))) is True
     message.answer.assert_awaited_once_with(SAFE_REPLY)  # type: ignore[attr-defined]
 
 
@@ -41,7 +49,7 @@ async def test_user_is_notified_on_callback_update() -> None:
     )
     object.__setattr__(callback, "answer", AsyncMock())
 
-    assert await handle_error(_error_event(Update(update_id=1, callback_query=callback))) is True
+    assert await _handler()(_error_event(Update(update_id=1, callback_query=callback))) is True
 
     callback.answer.assert_awaited_once_with(SAFE_REPLY, show_alert=True)  # type: ignore[attr-defined]
 
@@ -53,13 +61,13 @@ async def test_returns_true_so_aiogram_does_not_reraise() -> None:
     выживет на цикле поллинга, но §31 требует ещё и сообщения пользователю,
     а его в этом случае уже не будет.
     """
-    result = await handle_error(_error_event(Update(update_id=1, message=_message())))
+    result = await _handler()(_error_event(Update(update_id=1, message=_message())))
     assert result is not None and result is not False
 
 
 async def test_update_without_user_target_does_not_crash() -> None:
     """Апдейт, на который некому отвечать, не должен ронять обработчик."""
-    assert await handle_error(_error_event(Update(update_id=1))) is True
+    assert await _handler()(_error_event(Update(update_id=1))) is True
 
 
 async def test_failure_inside_notification_does_not_escape() -> None:
@@ -67,7 +75,46 @@ async def test_failure_inside_notification_does_not_escape() -> None:
     message = _message()
     message.answer.side_effect = RuntimeError("и ответить тоже не вышло")  # type: ignore[attr-defined]
 
-    assert await handle_error(_error_event(Update(update_id=1, message=message))) is True
+    assert await _handler()(_error_event(Update(update_id=1, message=message))) is True
+
+
+async def test_outsider_gets_no_safe_reply() -> None:
+    """Постороннему перехватчик не отвечает (§1.3).
+
+    Наблюдатель `errors` стоит снаружи цепочки middleware, то есть снаружи
+    `AuthMiddleware`: без проверки здесь сбой до авторизации давал
+    постороннему ответ. Молчание, а не отказ — по той же причине, что в
+    `bot/middlewares/auth.py`: любой ответ подтверждает, что бот живой.
+    """
+    message = _message()
+    object.__setattr__(message.from_user, "id", OUTSIDER_ID)
+
+    assert await _handler()(_error_event(Update(update_id=1, message=message))) is True
+
+    message.answer.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_update_without_sender_gets_no_reply() -> None:
+    """Не удалось определить отправителя — не отвечаем.
+
+    Отказ по умолчанию: апдейт без пользователя (например, `channel_post`)
+    не должен получать ответ лишь потому, что проверить его не удалось.
+    """
+    message = _message()
+    object.__setattr__(message, "from_user", None)
+
+    assert await _handler()(_error_event(Update(update_id=1, message=message))) is True
+
+    message.answer.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_empty_whitelist_answers_nobody() -> None:
+    """Пустой белый список — граничный случай: не отвечаем никому."""
+    message = _message()
+
+    assert await _handler(allowed=[])(_error_event(Update(update_id=1, message=message))) is True
+
+    message.answer.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 def test_safe_reply_has_no_traceback() -> None:
