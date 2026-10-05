@@ -30,12 +30,14 @@ from sqlalchemy import (
     DateTime,
     Double,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     SmallInteger,
     Text,
     Time,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -93,6 +95,21 @@ class Subject(Base):
 
 class Material(Base):
     __tablename__ = "materials"
+    __table_args__ = (
+        # §3.1, дубликаты материала у одного пользователя. Частичный по
+        # наличию ключа: §4.4 опознаёт дубль по sha256, а у материала без
+        # него (например, ссылки) ограничения быть не должно.
+        Index(
+            "uq_materials_user_sha256",
+            "user_id",
+            text("(origin->>'sha256')"),
+            unique=True,
+            postgresql_where=text("origin ? 'sha256'"),
+        ),
+        # §3.1, задел под общий кеш обработки: один и тот же файл у разных
+        # пользователей обрабатывается один раз.
+        Index("ix_materials_sha256", text("(origin->>'sha256')")),
+    )
 
     id: Mapped[int] = _pk()
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
@@ -134,6 +151,7 @@ class MediaAsset(Base):
 
 class Fragment(Base):
     __tablename__ = "fragments"
+    __table_args__ = (Index("ix_fragments_material_ord", "material_id", "ord"),)
 
     id: Mapped[int] = _pk()
     material_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("materials.id"), nullable=False)
@@ -192,6 +210,30 @@ class Fact(Base):
 
 class Question(Base):
     __tablename__ = "questions"
+    __table_args__ = (
+        Index("ix_questions_fact_status", "fact_id", "status"),
+        # §3.1: без этого условие `EXISTS (... status='valid')` в планировщике
+        # (§16) превращается в последовательное сканирование.
+        Index(
+            "ix_questions_fact_valid",
+            "fact_id",
+            postgresql_where=text("status = 'valid'"),
+        ),
+        # §3.1, И-6. Индекс **обязан** быть частичным и ограниченным именно
+        # `valid`. Без условия отклонённая строка занимает слот навсегда:
+        # перегенерация падает на IntegrityError, и факт теряет этот формат до
+        # конца жизни. Условие `status <> 'rejected'`, стоявшее в v3.4,
+        # закрывало половину проблемы — под него попадали строки `draft`,
+        # которые остаются после упавшего воркера.
+        Index(
+            "uq_questions_fact_type_direction_valid",
+            "fact_id",
+            "type",
+            "direction",
+            unique=True,
+            postgresql_where=text("status = 'valid'"),
+        ),
+    )
 
     id: Mapped[int] = _pk()
     fact_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("facts.id"), nullable=False)
@@ -224,6 +266,15 @@ class Question(Base):
 
 class ReviewState(Base):
     __tablename__ = "review_states"
+    __table_args__ = (
+        # §3.1, выборка планировщика: что пора повторять, без приостановленных.
+        Index(
+            "ix_review_states_user_due",
+            "user_id",
+            "due_at",
+            postgresql_where=text("NOT suspended"),
+        ),
+    )
 
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), primary_key=True)
     fact_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("facts.id"), primary_key=True)
@@ -280,6 +331,17 @@ class ReviewLog(Base):
 
 class Session(Base):
     __tablename__ = "sessions"
+    __table_args__ = (
+        # §3.1 и §38 №2: двух активных сессий одного пользователя быть не может.
+        # Ограничение в БД, а не в коде: гонка двух воркеров проверкой в коде
+        # не закрывается.
+        Index(
+            "uq_sessions_user_active",
+            "user_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+    )
 
     id: Mapped[int] = _pk()
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)

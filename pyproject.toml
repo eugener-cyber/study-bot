@@ -55,7 +55,10 @@ target-version = ["py312"]
 # type: ignore») проверки не выдержало — ревью PR #3, FAIL 3.2.
 [tool.mypy]
 python_version = "3.12"
-files = ["core", "bot"]
+# alembic/env.py — рукописный код, он под проверкой. Сами миграции в
+# alembic/versions/ не проверяются: это генерируемые файлы, и strict на них
+# означал бы правку каждой новой автогенерации без выигрыша.
+files = ["core", "bot", "alembic/env.py"]
 strict = true
 warn_unreachable = true
 
@@ -74,4 +77,5 @@ testpaths = ["tests"]
 addopts = ["-m", "not live"]
 markers = [
     "live: тест, которому нужна сеть. Вводится §36, в CI не участвует по §41.4.",
+    "db: тесту нужен Postgres на 127.0.0.1. Разрешение точечное, не снятие блокировки.",
 ]
