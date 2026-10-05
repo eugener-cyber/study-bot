@@ -10,6 +10,7 @@ TODO ниже, строка в STATE.md и блок «Перенесено из 
 from __future__ import annotations
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -18,6 +19,15 @@ from core.logging import get_logger
 log = get_logger(__name__)
 
 CONSENT_CALLBACK = "consent:accept"
+
+NOT_MODIFIED = "message is not modified"
+"""Фрагмент текста ошибки Telegram при правке сообщения на тот же текст.
+
+Отдельного класса исключения для этого случая в aiogram 3 нет, поэтому
+различение идёт по тексту. Если Telegram сменит формулировку, перестанет
+срабатывать узкая ветка и пользователь снова увидит безопасное сообщение —
+деградация в сторону прежнего поведения, а не в сторону потери согласия.
+"""
 
 GREETING = (
     "Здравствуйте.\n\n"
@@ -60,8 +70,25 @@ async def handle_consent(callback: CallbackQuery) -> None:
     log.info("consent_accepted", user_id=user_id)
 
     await callback.answer()
-    if isinstance(callback.message, Message):
+    if not isinstance(callback.message, Message):
+        return
+
+    # Повторное нажатие. Два рубежа, потому что одного не хватает: обычно
+    # второй callback приходит уже с правленым текстом и отсекается здесь, но
+    # при быстром двойном тапе оба приходят до того, как правка применилась,
+    # и тогда срабатывает ветка ниже. Без обоих Telegram отвечает
+    # «message is not modified», перехватчик ошибок превращает это в
+    # «Что-то пошло не так», и пользователь видит сбой на успешном действии.
+    if callback.message.text == CONSENT_ACCEPTED:
+        log.info("consent_repeat_click", user_id=user_id)
+        return
+
+    try:
         await callback.message.edit_text(CONSENT_ACCEPTED)
+    except TelegramBadRequest as error:
+        if NOT_MODIFIED not in str(error):
+            raise
+        log.info("consent_race_click", user_id=user_id)
 
 
 def build_start_router() -> Router:

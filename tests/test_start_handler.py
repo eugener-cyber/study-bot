@@ -7,28 +7,51 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import EditMessageText
 from aiogram.types import CallbackQuery, Chat, Message, User
 
 from bot.handlers.start import (
     CONSENT_ACCEPTED,
     CONSENT_CALLBACK,
     GREETING,
+    NOT_MODIFIED,
     consent_keyboard,
     handle_consent,
     handle_start,
 )
 
 
-def _message() -> Message:
+def _message(text: str | None = None) -> Message:
     message = Message(
         message_id=1,
         date=datetime.datetime(2026, 1, 1),
         chat=Chat(id=1, type="private"),
         from_user=User(id=111, is_bot=False, first_name="T"),
+        text=text,
     )
     object.__setattr__(message, "answer", AsyncMock())
     object.__setattr__(message, "edit_text", AsyncMock())
     return message
+
+
+def _callback(inner: Message) -> CallbackQuery:
+    callback = CallbackQuery(
+        id="1",
+        from_user=User(id=111, is_bot=False, first_name="T"),
+        chat_instance="x",
+        data=CONSENT_CALLBACK,
+        message=inner,
+    )
+    object.__setattr__(callback, "answer", AsyncMock())
+    return callback
+
+
+def _not_modified() -> TelegramBadRequest:
+    return TelegramBadRequest(
+        method=EditMessageText(text=CONSENT_ACCEPTED, chat_id=1, message_id=1),
+        message=f"Bad Request: {NOT_MODIFIED}",
+    )
 
 
 @pytest.mark.asyncio
@@ -48,22 +71,60 @@ async def test_start_attaches_keyboard() -> None:
 
 
 @pytest.mark.asyncio
-async def test_consent_click_is_handled_without_db() -> None:
-    """Запись users.consent_at перенесена в WP-02 (CR-B); нажатие не падает."""
+async def test_consent_click_answers_and_edits_message() -> None:
+    """Нажатие подтверждается и экран правится на текст согласия.
+
+    Имя теста прежде утверждало «without_db» и этим закрывало процедуру
+    приёмки «без обращения к БД», ничего такого не проверяя: кода БД в
+    проекте нет вовсе. Настоящая проверка появится в WP-02, когда будет
+    сессия, обращения к которой можно не ожидать (ревью PR #3, FAIL 4.5).
+    """
     inner = _message()
-    callback = CallbackQuery(
-        id="1",
-        from_user=User(id=111, is_bot=False, first_name="T"),
-        chat_instance="x",
-        data=CONSENT_CALLBACK,
-        message=inner,
-    )
-    object.__setattr__(callback, "answer", AsyncMock())
+    callback = _callback(inner)
 
     await handle_consent(callback)
 
     callback.answer.assert_awaited_once()  # type: ignore[attr-defined]
     inner.edit_text.assert_awaited_once_with(CONSENT_ACCEPTED)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_repeat_click_on_already_accepted_screen_is_noop() -> None:
+    """Обычное повторное нажатие: текст уже правленый, править нечего."""
+    inner = _message(text=CONSENT_ACCEPTED)
+    callback = _callback(inner)
+
+    await handle_consent(callback)
+
+    callback.answer.assert_awaited_once()  # type: ignore[attr-defined]
+    inner.edit_text.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_double_tap_race_does_not_show_failure_to_user() -> None:
+    """Быстрый двойной тап: оба callback пришли до применения правки.
+
+    Telegram отвечает «message is not modified», и до правки это доходило до
+    перехватчика ошибок, который показывал «Что-то пошло не так» на успешном
+    действии (ревью PR #3, FAIL 2.2).
+    """
+    inner = _message()
+    inner.edit_text.side_effect = _not_modified()  # type: ignore[attr-defined]
+
+    await handle_consent(_callback(inner))  # не должно поднять исключение
+
+
+@pytest.mark.asyncio
+async def test_other_bad_request_is_not_swallowed() -> None:
+    """Гасится ровно один случай, а не любая ошибка правки сообщения."""
+    inner = _message()
+    inner.edit_text.side_effect = TelegramBadRequest(  # type: ignore[attr-defined]
+        method=EditMessageText(text=CONSENT_ACCEPTED, chat_id=1, message_id=1),
+        message="Bad Request: message to edit not found",
+    )
+
+    with pytest.raises(TelegramBadRequest):
+        await handle_consent(_callback(inner))
 
 
 def test_consent_text_mentions_storage() -> None:
