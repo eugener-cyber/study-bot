@@ -89,9 +89,7 @@ class RecordingSession(BaseSession):
         """
         out = [c.text for c in self.calls if isinstance(c, SendMessage)]
         out += [
-            c.text
-            for c in self.calls
-            if isinstance(c, AnswerCallbackQuery) and c.text is not None
+            c.text for c in self.calls if isinstance(c, AnswerCallbackQuery) and c.text is not None
         ]
         return out
 
