@@ -11,9 +11,10 @@
 from __future__ import annotations
 
 import logging
+from typing import cast
 
 import structlog
-from structlog.typing import EventDict, WrappedLogger
+from structlog.typing import EventDict, FilteringBoundLogger, WrappedLogger
 
 TRUNCATE_AT = 80
 """Предел длины для полей с пользовательским содержимым (§31)."""
@@ -67,6 +68,20 @@ def configure_logging(level: int = logging.INFO) -> None:
     )
 
 
-def get_logger(name: str) -> structlog.stdlib.BoundLogger:
-    """Логгер с именем модуля."""
-    return structlog.get_logger(name)  # type: ignore[no-any-return]
+def get_logger(name: str) -> FilteringBoundLogger:
+    """Логгер с именем модуля.
+
+    Тип возврата — `FilteringBoundLogger`, а не `structlog.stdlib.BoundLogger`:
+    `configure_logging` ставит `wrapper_class=make_filtering_bound_logger(...)`,
+    и фактический объект — `BoundLoggerLazyProxy`, после первого использования
+    `BoundLoggerFilteringAtInfo`. Методов `stdlib.BoundLogger` (`setLevel`,
+    `addHandler`) у него нет.
+
+    Прежняя аннотация вместе с `type: ignore[no-any-return]` заставляла
+    `mypy --strict` верить в несуществующий тип: вызов `log.setLevel(10)`
+    проходил проверку и падал `AttributeError` в рантайме. `cast` вместо
+    `type: ignore` оставляет проверку рабочей — `structlog.get_logger`
+    не типизирован и возвращает `Any`, и это единственное, что здесь
+    действительно нужно подавить.
+    """
+    return cast(FilteringBoundLogger, structlog.get_logger(name))

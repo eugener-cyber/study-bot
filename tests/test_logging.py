@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from core.logging import TRUNCATE_AT, TRUNCATED_FIELDS, truncate_user_content
+import logging
+
+import structlog
+
+from core.logging import (
+    TRUNCATE_AT,
+    TRUNCATED_FIELDS,
+    configure_logging,
+    get_logger,
+    truncate_user_content,
+)
 
 
 def test_long_field_truncated_exactly() -> None:
@@ -34,3 +44,18 @@ def test_service_fields_not_truncated() -> None:
 def test_truncated_fields_cover_user_content() -> None:
     for field in ("text", "statement", "answer", "question"):
         assert field in TRUNCATED_FIELDS
+
+
+def test_get_logger_type_matches_annotation() -> None:
+    """Аннотация `get_logger` обязана совпадать с фактическим объектом.
+
+    Прежде она объявляла `structlog.stdlib.BoundLogger`, а `type: ignore`
+    закрывал расхождение. В результате `mypy --strict` на `core/` — проверка,
+    которая по §35 и существует для защиты логики — пропускал вызов
+    `log.setLevel(10)`, падающий `AttributeError` в рантайме.
+    """
+    configure_logging()
+    bound = get_logger("test").bind()
+
+    assert isinstance(bound, structlog.make_filtering_bound_logger(logging.INFO))
+    assert not isinstance(bound, structlog.stdlib.BoundLogger)
