@@ -119,18 +119,25 @@ class RecordingSession(BaseSession):
         return out
 
 
-def _settings() -> Settings:
-    return Settings(  # type: ignore[arg-type]
-        _env_file=None,
-        BOT_TOKEN="0000000000:X",
-        TELEGRAM_API_ID="1",
-        TELEGRAM_API_HASH="h" * 32,
-        ALLOWED_USER_IDS=str(ALLOWED_ID),
-        DATABASE_URL="postgresql+asyncpg://t:t@localhost/t",
-        REDIS_URL="redis://localhost:6379/0",
-        TZ_DEFAULT="Europe/Moscow",
-        LLM_PROVIDER="manual",
-    )
+def _settings(**overrides: str) -> Settings:
+    """Настройки для тестов. `overrides` — для порогов, которых нет в умолчании.
+
+    Нужны, например, тесту гейта бюджета: `COST_WARN_THRESHOLD` по умолчанию
+    `None` (в §30.3 он `TODO(owner)`), и проверить срабатывание гейта без
+    подстановки значения нельзя.
+    """
+    base = {
+        "BOT_TOKEN": "0000000000:X",
+        "TELEGRAM_API_ID": "1",
+        "TELEGRAM_API_HASH": "h" * 32,
+        "ALLOWED_USER_IDS": str(ALLOWED_ID),
+        "DATABASE_URL": "postgresql+asyncpg://t:t@localhost/t",
+        "REDIS_URL": "redis://localhost:6379/0",
+        "TZ_DEFAULT": "Europe/Moscow",
+        "LLM_PROVIDER": "manual",
+    }
+    base.update(overrides)
+    return Settings(_env_file=None, **base)  # type: ignore[arg-type]
 
 
 def _redis() -> AsyncMock:
