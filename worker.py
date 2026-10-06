@@ -19,12 +19,19 @@ from __future__ import annotations
 import os
 from typing import Any, ClassVar
 
+from aiogram import Bot
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from arq import cron
 from arq.connections import RedisSettings
+from sqlalchemy import select
 
+from bot.handlers.gate import gate_keyboard
+from bot.main import LOCAL_BOT_API
 from core.adapters.stub import StubAdapter
 from core.config import Settings, load_settings
 from core.db.engine import build_engine, build_sessionmaker
+from core.db.models import Material, User
 from core.db.session import session_scope
 from core.harness import fragments_from_text
 from core.ingest import handlers as h
@@ -101,7 +108,13 @@ async def process_material_task(ctx: dict[str, Any], material_id: int, source_pa
             source_path,
         )
     except AwaitingUser as awaiting:
-        log.info("task_parked", material_id=material_id, question=awaiting.question)
+        # Вопрос обязан дойти до пользователя: без него материал стоит в
+        # `awaiting_user` молча, а §4.5 на этом и держится — продолжение
+        # ставит в очередь обработчик нажатия кнопки, и без кнопки его не
+        # будет. Тайм-аут тогда переведёт материал в `failed` через сутки, и
+        # выглядеть это будет сбоем системы.
+        await _ask_user(ctx, material_id, awaiting.question)
+        log.info("task_parked", material_id=material_id)
         return "awaiting_user"
     except Exception as error:
         log.error("task_failed", material_id=material_id, error_type=type(error).__name__)
@@ -134,6 +147,42 @@ def fragments_from_text_or_stub(source_path: str) -> list[Any]:
     return []
 
 
+async def _ask_user(ctx: dict[str, Any], material_id: int, question: str) -> None:
+    """Задаёт пользователю вопрос гейта с кнопками §6.3.
+
+    Сбой отправки гасится и логируется: исключение здесь заменило бы
+    «ждём ответа» на «задача упала», и материал ушёл бы в `failed` при живом
+    гейте. Пользователь в этом случае увидит вопрос позже — после тайм-аута
+    и повторной обработки, — но данные не потеряются.
+    """
+    bot: Bot | None = ctx.get("bot")
+    if bot is None:
+        log.info("question_not_sent_no_bot", material_id=material_id)
+        return
+
+    async with session_scope(ctx["sessions"]) as session:
+        tg_id = (
+            await session.execute(
+                select(User.tg_id)
+                .join(Material, Material.user_id == User.id)
+                .where(Material.id == material_id)
+            )
+        ).scalar_one_or_none()
+
+    if tg_id is None:
+        log.info("question_not_sent_no_owner", material_id=material_id)
+        return
+
+    try:
+        await bot.send_message(
+            chat_id=int(tg_id),
+            text=f"{question}\n\nЧто делать?",
+            reply_markup=gate_keyboard(material_id),
+        )
+    except Exception:
+        log.error("question_not_sent", material_id=material_id, exc_info=True)
+
+
 async def expire_awaiting_task(ctx: dict[str, Any]) -> int:
     """Переводит в `failed` материалы, ждущие ответа дольше тайм-аута (§4.5).
 
@@ -156,10 +205,21 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["engine"] = engine
     ctx["sessions"] = build_sessionmaker(engine)
     ctx["storage"] = MaterialStorage(MATERIALS_ROOT)
+
+    # Воркеру нужен бот: гейт бюджета задаёт вопрос, и задавать его больше
+    # некому — хендлер к этому моменту давно ответил пользователю и вышел.
+    # Сессия та же, что у бота: локальный Bot API (§2.2).
+    ctx["bot"] = Bot(
+        token=settings.BOT_TOKEN,
+        session=AiohttpSession(api=TelegramAPIServer.from_base(LOCAL_BOT_API)),
+    )
     log.info("worker_started", queue=QUEUE_NAME)
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
+    bot: Bot | None = ctx.get("bot")
+    if bot is not None:
+        await bot.session.close()
     await ctx["engine"].dispose()
     log.info("worker_stopped")
 

@@ -22,7 +22,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.errors import build_error_handler
-from bot.handlers import start, upload
+from bot.handlers import gate, start, upload
 from bot.middlewares.auth import AuthMiddleware
 from bot.middlewares.db_session import DbSessionMiddleware
 from bot.middlewares.throttle import ThrottleMiddleware
@@ -87,6 +87,7 @@ def build_dispatcher(
         dispatcher.update.outer_middleware(DbSessionMiddleware(sessions))
 
     dispatcher.include_router(start.build_start_router())
+    dispatcher.include_router(gate.build_gate_router(arq))
     dispatcher.include_router(upload.build_upload_router(arq))
     return dispatcher
 
