@@ -94,6 +94,20 @@ async def _load(session: AsyncSession, material_id: int) -> Material:
     return (await session.execute(select(Material).where(Material.id == material_id))).scalar_one()
 
 
+async def _is_notes_only(sessions: async_sessionmaker[AsyncSession], material_id: int) -> bool:
+    """Режим материала читается из базы на каждой стадии, а не кешируется.
+
+    Между стадиями пользователь мог нажать «Только конспект, без тестов» или,
+    наоборот, «Достроить задания» (§6.3), и значение, прочитанное один раз в
+    начале, относилось бы к прошлому решению.
+    """
+    async with session_scope(sessions) as session:
+        mode = (
+            await session.execute(select(Material.mode).where(Material.id == material_id))
+        ).scalar_one()
+    return mode == "notes_only"
+
+
 async def _mark_completed(session: AsyncSession, material_id: int, marker: str) -> None:
     """Добавляет отметку в `completed_stages` внутри транзакции стадии.
 
@@ -175,6 +189,16 @@ async def process_material(
         stage = next_stage(completed)
         if stage is None or stage not in stages:
             break
+
+        if stage.skippable and await _is_notes_only(sessions, material_id):
+            # §6.3, режим «Только конспект, без тестов». Пропуск фиксируется
+            # как `questions:skipped`, а не `questions`: по этой разнице
+            # возобновление отличает «пропущено сознательно» от «выполнено», а
+            # кнопка «Достроить задания» знает, что доделывать (§4.1).
+            async with session_scope(sessions) as session:
+                await _mark_completed(session, material_id, stage.skipped_marker)
+            log.info("stage_skipped", stage=stage.name, material_id=material_id)
+            continue
 
         handler = handlers.get(stage.name)
         if handler is None:

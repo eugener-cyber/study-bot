@@ -29,7 +29,9 @@ from core.db.session import session_scope
 from core.harness import fragments_from_text
 from core.ingest import handlers as h
 from core.ingest.awaiting import expire_stale
+from core.ingest.gate import probe_and_gate, reestimate_after_extract
 from core.ingest.pipeline import AwaitingUser, StageHandler, process_material
+from core.ingest.stages import EXTRACT
 from core.logging import configure_logging, get_logger
 from core.services.materials import mark_failed, mark_ready
 from core.storage import MaterialStorage
@@ -69,6 +71,27 @@ async def process_material_task(ctx: dict[str, Any], material_id: int, source_pa
     adapter = StubAdapter(fragments=fragments_from_text_or_stub(source_path))
 
     try:
+        # Гейт бюджета — ДО конвейера, а не внутри. §6.3: для сканированного
+        # PDF `extract` это vision-вызов на каждую страницу, и гейт после него
+        # спрашивал бы «обрабатывать?» после того, как деньги потрачены.
+        preliminary = await probe_and_gate(sessions, material_id, adapter, source_path, settings)
+
+        # Извлечение отдельно от остальных стадий: сразу после него оценка
+        # пересчитывается по фактическим фрагментам, и при расхождении больше
+        # `COST_REESTIMATE_FACTOR` пользователь спрашивается повторно. Без
+        # этого гейт обходится любым материалом, чью стоимость `probe`
+        # недооценил (§6.3).
+        await process_material(
+            sessions,
+            storage,
+            stage_handlers(settings),
+            material_id,
+            adapter,
+            source_path,
+            stages=(EXTRACT,),
+        )
+        await reestimate_after_extract(sessions, material_id, preliminary, settings)
+
         await process_material(
             sessions,
             storage,
