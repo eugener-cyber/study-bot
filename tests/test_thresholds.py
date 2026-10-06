@@ -113,7 +113,7 @@ def test_no_config_field_missing_from_spec() -> None:
     План обещал проверку «или наоборот», но реализовано было только одно
     направление: Проверяющий добавил в Settings поле `INVENTED_THRESHOLD`, и
     прогон остался зелёным (ревью PR #3, FAIL 4.4). Смысл направления виден
-    на этом же пакете: `MAX_INTERVAL_DAYS` и `UNSUPPORTED_REPLY_COOLDOWN_SEC`
+    на этом же пакете: `MAX_INTERVAL_DAYS` и `RECOGNITION_ONLY_CAP`
     пришли через change request, и эта проверка не дала бы добавить порог в
     конфиг, забыв про спецификацию.
     """

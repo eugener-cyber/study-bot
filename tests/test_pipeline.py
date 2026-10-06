@@ -23,7 +23,7 @@ from core.adapters.base import ExtractedFragment, SourceMeta
 from core.adapters.stub import StubAdapter
 from core.db.models import Fact, Fragment, Material, Question, ReviewState, Section, User
 from core.ingest import handlers as h
-from core.ingest.pipeline import StageContext, process_material, run_stage
+from core.ingest.pipeline import StageContext, StageHandler, process_material, run_stage
 from core.ingest.stages import ORDER, next_stage, reopen_for_questions
 from core.storage import MaterialStorage
 from tests.test_dispatcher import _settings
@@ -33,7 +33,7 @@ pytestmark = pytest.mark.db
 NOW = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
 
 
-def _handlers() -> dict[str, h.StageHandler]:
+def _handlers() -> dict[str, StageHandler]:
     return {
         "extract": h.extract,
         "sections": h.sections_stub,
@@ -111,7 +111,7 @@ async def _run(
     sessions: async_sessionmaker[AsyncSession],
     storage: MaterialStorage,
     material_id: int,
-    handlers: dict[str, h.StageHandler] | None = None,
+    handlers: dict[str, StageHandler] | None = None,
     adapter: StubAdapter | None = None,
 ) -> None:
     await process_material(

@@ -25,8 +25,8 @@ from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage, T
 from aiogram.types import CallbackQuery, Chat, InlineQuery, Message, PhotoSize, Update, User
 
 from bot.errors import SAFE_REPLY
-from bot.handlers.fallback import REPLY
 from bot.handlers.start import CONSENT_CALLBACK, GREETING
+from bot.handlers.upload import NO_CONSENT
 from bot.main import build_dispatcher
 from core.config import Settings
 from tests.conftest import noop_sessions
@@ -192,28 +192,40 @@ async def test_start_is_answered_for_allowed_user() -> None:
     assert session.texts() == [GREETING]
 
 
-async def test_fallback_router_does_not_swallow_start() -> None:
-    """Порядок роутеров: перехватчик §19.4 включён последним.
+async def test_upload_router_does_not_swallow_start() -> None:
+    """Порядок роутеров: приём материалов не перехватывает команды.
 
-    Проверяющий включил его первым — прогон остался зелёным, хотя `/start`
-    перестал работать. Ассерт на точный текст это ловит.
+    Раньше здесь стоял перехватчик §19.4, и Проверяющий включил его первым —
+    прогон остался зелёным, хотя `/start` перестал работать. Проверка
+    сохранена после удаления §19.4: роутер приёма ловит документ и фотографию,
+    и ошибка в фильтре снова увела бы команду не туда.
     """
     bot, session = _bot()
-    dispatcher = build_dispatcher(_settings(), _redis())
+    dispatcher = build_dispatcher(_settings(), _redis(), noop_sessions)  # type: ignore[arg-type]
 
     await dispatcher.feed_update(bot, _message_update(ALLOWED_ID, text="/start"))
 
-    assert REPLY not in session.texts()
+    assert session.texts() == [GREETING]
 
 
-async def test_unsupported_input_reaches_fallback() -> None:
+async def test_photo_reaches_upload_router_not_silence() -> None:
+    """Фотография доходит до приёма материалов, а не отбрасывается молча.
+
+    Это то, ради чего вводился §19.4 (CR-F, Issue #5): тестировщик прислал
+    фотографии и не получил ответа. Теперь обработчик есть, и §19.4 удалён —
+    но проверка, что фотография не падает в тишину, осталась.
+
+    Пользователь здесь без согласия, поэтому ответ — приглашение к /start:
+    приём материала означает хранение файла, то есть начало обработки
+    персональных данных, и согласие это ровно то, что разрешает (§31).
+    """
     bot, session = _bot()
-    dispatcher = build_dispatcher(_settings(), _redis())
+    dispatcher = build_dispatcher(_settings(), _redis(), noop_sessions)  # type: ignore[arg-type]
     photo = [PhotoSize(file_id="f", file_unique_id="u", width=1, height=1)]
 
     await dispatcher.feed_update(bot, _message_update(ALLOWED_ID, photo=photo))
 
-    assert session.texts() == [REPLY]
+    assert session.texts() == [NO_CONSENT], "фотография не дошла до обработчика"
 
 
 async def test_outsider_gets_nothing_at_all() -> None:
