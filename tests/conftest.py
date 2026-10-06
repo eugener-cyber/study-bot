@@ -186,3 +186,49 @@ async def clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
     async with engine.begin() as connection:
         await connection.execute(sql_text(f"TRUNCATE {names} RESTART IDENTITY CASCADE"))
     yield
+
+
+class NoopSession:
+    """Сессия-заглушка для тестов, которым база не нужна.
+
+    Нужна потому, что `handle_consent` объявляет параметр `session`, и без
+    него aiogram не может вызвать хендлер. Сами обращения к базе в таких
+    тестах подменяются на уровне сервиса — см. фикстуру `no_consent_write`.
+    """
+
+    async def __aenter__(self) -> NoopSession:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+
+def noop_sessions() -> NoopSession:
+    """Фабрика сессий-заглушек — для `build_dispatcher` в тестах без базы."""
+    return NoopSession()
+
+
+@pytest.fixture
+def no_consent_write(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Подменяет запись согласия, оставляя поведение экрана настоящим.
+
+    Тесты интерфейса согласия проверяют порядок правок сообщения и реакцию на
+    повторное нажатие — не SQL. Подмена на уровне сервиса удерживает их от
+    зависимости от формы запроса: иначе правка `ON CONFLICT` ломала бы тесты,
+    которые про неё ничего не утверждают.
+    """
+    import bot.handlers.start as start_module
+
+    recorded: list[int] = []
+
+    async def fake(_session: object, tg_id: int) -> None:
+        recorded.append(tg_id)
+
+    monkeypatch.setattr(start_module, "accept_consent", fake)
+    return recorded
