@@ -302,6 +302,80 @@ async def test_fact_with_missing_fragment_is_not_teachable(
     assert fact_id not in await _teachable_ids(engine, threshold)
 
 
+@pytest.mark.parametrize("threshold", [0.55, 0.0])
+async def test_mixed_quality_ignores_the_unmeasured_fragment(
+    engine: AsyncEngine, clean_tables: None, threshold: float
+) -> None:
+    """Фрагмент с `quality = NULL` рядом с измеренным **игнорируется**.
+
+    Фиксирую фактическое поведение, а не желаемое. `MIN` в SQL пропускает
+    `NULL`, поэтому факт с фрагментами 1.0 и `NULL` обучаем с
+    `final_confidence = 1.0` — как будто второго фрагмента нет.
+
+    Вырожденный случай (все фрагменты `NULL`) покрыт отдельным тестом и даёт
+    исключение факта. Смесь не покрывал никто, хотя поведение было известно:
+    докстрока того теста сама пишет, что `MIN` игнорирует `NULL`. Нашло ревью
+    PR #10.
+
+    **Правильно ли это — вопрос к Архитектору, а не правка здесь.** §7.3
+    определяет `final_confidence = confidence × min(fragment.quality)` и не
+    говорит, что делать с неизвестным качеством части evidence. Тест
+    закрепляет текущее поведение, чтобы смена была сознательной, а не
+    случайной; вопрос оформлен change request'ом.
+    """
+    material_id, section_id = await _scaffold(engine)
+    measured = await _fragment(engine, material_id, 1.0)
+    unmeasured = await _fragment(engine, material_id, None)
+    fact_id = await _fact(
+        engine,
+        section_id,
+        material_id,
+        fragment_ids=[measured, unmeasured],
+        confidence=1.0,
+    )
+    await _question(engine, fact_id, "valid")
+
+    assert fact_id in await _teachable_ids(engine, threshold), (
+        "поведение смеси изменилось — это сознательная правка или дефект?"
+    )
+
+
+@pytest.mark.parametrize("threshold", [0.55, 0.0])
+async def test_mixed_evidence_ignores_the_broken_reference(
+    engine: AsyncEngine, clean_tables: None, threshold: float
+) -> None:
+    """Битая ссылка рядом с существующим фрагментом **игнорируется**.
+
+    Тот же механизм, другой путь: `MIN` по множеству, где часть
+    идентификаторов не находится, считается по найденным. Факт обучаем, хотя
+    часть его evidence не существует.
+
+    Вырожденный случай (все ссылки битые) исключает факт — это проверено
+    отдельно. Смесь не проверял никто. Отдельный тест, потому что пустой
+    массив и битая ссылка — разные пути к одному `NULL`, и защита от первого
+    не обязана закрывать второй.
+
+    Как и выше, поведение зафиксировано, а не исправлено: §7.3 проверка 1
+    требует, чтобы `fact.fragment_ids ⊆ submitted_fragment_ids` проверялось на
+    стадии извлечения, а не в предикате. Дублировать проверку здесь значило бы
+    реализовать больше, чем требует §14.3.
+    """
+    material_id, section_id = await _scaffold(engine)
+    existing = await _fragment(engine, material_id, 1.0)
+    fact_id = await _fact(
+        engine,
+        section_id,
+        material_id,
+        fragment_ids=[existing, 999_999],
+        confidence=1.0,
+    )
+    await _question(engine, fact_id, "valid")
+
+    assert fact_id in await _teachable_ids(engine, threshold), (
+        "поведение смеси изменилось — это сознательная правка или дефект?"
+    )
+
+
 async def test_returned_confidence_is_never_null(engine: AsyncEngine, clean_tables: None) -> None:
     """`final_confidence` приходит потребителям числом, а не `NULL`.
 
