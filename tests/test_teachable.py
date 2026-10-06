@@ -335,9 +335,9 @@ async def test_mixed_quality_ignores_the_unmeasured_fragment(
     )
     await _question(engine, fact_id, "valid")
 
-    assert fact_id in await _teachable_ids(engine, threshold), (
-        "поведение смеси изменилось — это сознательная правка или дефект?"
-    )
+    assert fact_id in await _teachable_ids(
+        engine, threshold
+    ), "поведение смеси изменилось — это сознательная правка или дефект?"
 
 
 @pytest.mark.parametrize("threshold", [0.55, 0.0])
@@ -371,9 +371,9 @@ async def test_mixed_evidence_ignores_the_broken_reference(
     )
     await _question(engine, fact_id, "valid")
 
-    assert fact_id in await _teachable_ids(engine, threshold), (
-        "поведение смеси изменилось — это сознательная правка или дефект?"
-    )
+    assert fact_id in await _teachable_ids(
+        engine, threshold
+    ), "поведение смеси изменилось — это сознательная правка или дефект?"
 
 
 async def test_returned_confidence_is_never_null(engine: AsyncEngine, clean_tables: None) -> None:

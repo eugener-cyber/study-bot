@@ -28,9 +28,7 @@ NOW = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
 
 async def _user_count(engine: AsyncEngine) -> int:
     async with engine.connect() as connection:
-        return int(
-            (await connection.execute(select(func.count()).select_from(User))).scalar_one()
-        )
+        return int((await connection.execute(select(func.count()).select_from(User))).scalar_one())
 
 
 async def test_successful_scope_commits(
