@@ -31,7 +31,16 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["bot", "bot.middlewares", "bot.handlers", "core", "core.db", "core.services"]
+packages = [
+    "bot",
+    "bot.middlewares",
+    "bot.handlers",
+    "core",
+    "core.adapters",
+    "core.db",
+    "core.ingest",
+    "core.services",
+]
 
 [tool.ruff]
 line-length = 100
