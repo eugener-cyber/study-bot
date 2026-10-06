@@ -20,7 +20,8 @@ from aiogram.types import Message
 from arq import ArqRedis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.progress import stage_text
+from bot.progress import ProgressMessage, stage_text
+from core.ingest.awaiting import remember_message
 from core.logging import get_logger
 from core.services.materials import create_or_find, sha256_of
 from core.services.users import find_by_tg_id
@@ -133,7 +134,8 @@ async def handle_material(
         name = f"photo-{file_id[:8]}.jpg"
         suffix = ".jpg"
 
-    progress = await message.answer(stage_text("probe"))
+    sent = await message.answer(stage_text("probe"))
+    progress = ProgressMessage(sent)
     path = await _download(message, file_id, suffix)
 
     material, duplicate = await create_or_find(
@@ -146,22 +148,30 @@ async def handle_material(
 
     if duplicate:
         # §4.4: показывается существующий материал, копия не создаётся.
-        await progress.edit_text(
+        # `force`: итоговое состояние обязано дойти независимо от того, когда
+        # была прошлая правка, — ограничитель частоты его бы отбросил.
+        await progress.update(
             f"Этот файл уже есть: «{material.title}».\n\n"
-            "Обрабатывать заново не нужно — он в вашем списке материалов."
+            "Обрабатывать заново не нужно — он в вашем списке материалов.",
+            force=True,
         )
         return
 
+    # Идентификатор сообщения запоминается до постановки задачи: правит его
+    # воркер, а создаёт хендлер, и передать его иначе нечем (§4.5).
+    await remember_message(session, material.id, sent.message_id)
+
     if arq is not None:
         await arq.enqueue_job("process_material_task", material.id, str(path))
-        await progress.edit_text(stage_text("extract"))
+        await progress.update(stage_text("extract"), force=True)
         log.info("material_enqueued", material_id=material.id, kind=kind)
     else:
         # Воркера нет — материал остаётся в `queued`. Это честнее, чем
         # обрабатывать в хендлере: §4.5 требует, чтобы конвейер шёл фоном, и
         # обработка здесь блокировала бы ответы пользователю на минуты.
-        await progress.edit_text(
-            "Материал принят и ждёт обработки. Она начнётся, когда запустится воркер."
+        await progress.update(
+            "Материал принят и ждёт обработки. Она начнётся, когда запустится воркер.",
+            force=True,
         )
         log.info("material_queued_without_worker", material_id=material.id)
 

@@ -32,6 +32,20 @@ log = get_logger(__name__)
 AWAITING_STAGE = "awaiting_user"
 """Значение `progress.stage` при ожидании. §4.5 называет его буквально."""
 
+MESSAGE_ID_KEY = "message_id"
+"""Ключ с идентификатором сообщения прогресса внутри `progress`.
+
+§4.5 требует «одно сообщение, редактируемое `edit_message_text`», но §3 поля
+под его идентификатор не даёт: `sessions.control_message_id` относится к
+сеансу повторения (§20), а не к обработке материала. Ключ живёт в том же
+`progress`, куда §4.5 уже складывает `stage` и `question`.
+
+**Переживает `park` и `resume`.** Это не деталь: иначе первый же проход через
+гейт бюджета терял бы сообщение, и прогресс после подтверждения уходил бы в
+новое — то есть §4.5 «одно сообщение» нарушалось бы именно в том сценарии,
+для которого ожидание и существует. Нашло ревью PR #14.
+"""
+
 
 async def park(
     session: AsyncSession,
@@ -52,6 +66,7 @@ async def park(
     §4.1 перечисляет четыре статуса, и пятый сломал бы все выборки по
     `status`, написанные по спецификации.
     """
+    previous = await _progress(session, material_id)
     progress: dict[str, Any] = {
         "stage": AWAITING_STAGE,
         "question": question,
@@ -60,6 +75,8 @@ async def park(
     }
     if payload:
         progress["payload"] = payload
+    if MESSAGE_ID_KEY in previous:
+        progress[MESSAGE_ID_KEY] = previous[MESSAGE_ID_KEY]
 
     await session.execute(
         update(Material).where(Material.id == material_id).values(progress=progress)
@@ -70,11 +87,17 @@ async def park(
 async def resume(session: AsyncSession, material_id: int) -> None:
     """Снимает ожидание. Вызывается обработчиком нажатия кнопки.
 
-    `progress` затирается целиком, а не правится поле `stage`: остатки
-    `question` и `payload` от прошлого ожидания попали бы в следующее, и
-    пользователь увидел бы вопрос о бюджете при выборе языка.
+    `progress` затирается, а не правится поле `stage`: остатки `question` и
+    `payload` от прошлого ожидания попали бы в следующее, и пользователь
+    увидел бы вопрос о бюджете при выборе языка.
+
+    Исключение — `message_id`: он относится не к ожиданию, а к обработке
+    материала целиком, и затирать его значило бы потерять сообщение прогресса
+    после каждого подтверждения (§4.5 «одно сообщение»).
     """
-    await session.execute(update(Material).where(Material.id == material_id).values(progress={}))
+    previous = await _progress(session, material_id)
+    kept = {MESSAGE_ID_KEY: previous[MESSAGE_ID_KEY]} if MESSAGE_ID_KEY in previous else {}
+    await session.execute(update(Material).where(Material.id == material_id).values(progress=kept))
     log.info("material_resumed", material_id=material_id)
 
 
@@ -101,6 +124,30 @@ async def awaiting_kind(session: AsyncSession, material_id: int) -> str | None:
         return None
     kind = progress.get("kind")
     return str(kind) if kind else None
+
+
+async def remember_message(session: AsyncSession, material_id: int, message_id: int) -> None:
+    """Запоминает сообщение прогресса материала (§4.5).
+
+    Пишется при постановке в очередь: сообщение создаёт хендлер, а правит его
+    воркер, и передать идентификатор иначе нечем — задача ARQ получает только
+    аргументы, а сообщение появляется до её постановки.
+    """
+    progress = await _progress(session, material_id)
+    progress[MESSAGE_ID_KEY] = message_id
+    await session.execute(
+        update(Material).where(Material.id == material_id).values(progress=progress)
+    )
+
+
+async def progress_message_id(session: AsyncSession, material_id: int) -> int | None:
+    """Идентификатор сообщения прогресса, или `None`, если его нет.
+
+    `None` — нормальный исход: материал мог прийти через `make seed`, где
+    Telegram не участвует вовсе.
+    """
+    value = (await _progress(session, material_id)).get(MESSAGE_ID_KEY)
+    return int(value) if value is not None else None
 
 
 async def expire_stale(session: AsyncSession, settings: Settings) -> list[int]:

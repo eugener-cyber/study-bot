@@ -28,6 +28,7 @@ from sqlalchemy import select
 
 from bot.handlers.gate import gate_keyboard
 from bot.main import LOCAL_BOT_API
+from bot.progress import stage_text
 from core.adapters.stub import StubAdapter
 from core.config import Settings, load_settings
 from core.db.engine import build_engine, build_sessionmaker
@@ -35,7 +36,7 @@ from core.db.models import Material, User
 from core.db.session import session_scope
 from core.harness import fragments_from_text
 from core.ingest import handlers as h
-from core.ingest.awaiting import expire_stale
+from core.ingest.awaiting import expire_stale, progress_message_id
 from core.ingest.gate import probe_and_gate, reestimate_after_extract
 from core.ingest.pipeline import AwaitingUser, StageHandler, process_material
 from core.ingest.stages import EXTRACT
@@ -98,6 +99,7 @@ async def process_material_task(ctx: dict[str, Any], material_id: int, source_pa
             stages=(EXTRACT,),
         )
         await reestimate_after_extract(sessions, material_id, preliminary, settings)
+        await _show_stage(ctx, material_id, "sections")
 
         await process_material(
             sessions,
@@ -118,16 +120,22 @@ async def process_material_task(ctx: dict[str, Any], material_id: int, source_pa
         return "awaiting_user"
     except Exception as error:
         log.error("task_failed", material_id=material_id, error_type=type(error).__name__)
+        # `mark_failed` в СВОЕЙ транзакции: сбой случился в другой, и та уже
+        # откачена. Запись в той же границе была бы откачена вместе со сбоем,
+        # и материал остался бы в `processing` навсегда — §4.1 такого
+        # состояния не предусматривает.
         async with session_scope(sessions) as session:
             await mark_failed(
                 session,
                 material_id,
                 "Не удалось обработать материал. Нажмите «Обработать заново».",
             )
+        await _show_failed(ctx, material_id)
         raise
 
     async with session_scope(sessions) as session:
         await mark_ready(session, material_id)
+    await _show_done(ctx, material_id)
     return "ready"
 
 
@@ -145,6 +153,59 @@ def fragments_from_text_or_stub(source_path: str) -> list[Any]:
     if path.is_file() and path.suffix.lower() in {".md", ".txt"}:
         return fragments_from_text(path)
     return []
+
+
+async def _edit_progress(ctx: dict[str, Any], material_id: int, text: str) -> bool:
+    """Правит сообщение прогресса материала. Возвращает, получилось ли.
+
+    Воркер правит **то же** сообщение, которое создал хендлер (§4.5: «одно
+    сообщение»). Идентификатор берётся из `progress.message_id` — его положил
+    туда хендлер при постановке задачи.
+
+    `None` вместо идентификатора — нормальный исход: материал мог прийти через
+    `make seed`, где Telegram не участвует вовсе. Сбой правки гасится: §4.5
+    про отображение прогресса, и падать из-за него посреди обработки значило
+    бы терять материал из-за косметики.
+    """
+    bot: Bot | None = ctx.get("bot")
+    if bot is None:
+        return False
+
+    async with session_scope(ctx["sessions"]) as session:
+        message_id = await progress_message_id(session, material_id)
+        chat_id = (
+            await session.execute(
+                select(User.tg_id)
+                .join(Material, Material.user_id == User.id)
+                .where(Material.id == material_id)
+            )
+        ).scalar_one_or_none()
+
+    if message_id is None or chat_id is None:
+        return False
+
+    try:
+        await bot.edit_message_text(text=text, chat_id=int(chat_id), message_id=message_id)
+    except Exception:
+        log.info("progress_not_edited", material_id=material_id)
+        return False
+    return True
+
+
+async def _show_stage(ctx: dict[str, Any], material_id: int, stage: str) -> None:
+    await _edit_progress(ctx, material_id, stage_text(stage))
+
+
+async def _show_done(ctx: dict[str, Any], material_id: int) -> None:
+    await _edit_progress(ctx, material_id, "✅ Готово. Материал обработан, задания в расписании.")
+
+
+async def _show_failed(ctx: dict[str, Any], material_id: int) -> None:
+    await _edit_progress(
+        ctx,
+        material_id,
+        "Не удалось обработать материал. Нажмите «Обработать заново».",
+    )
 
 
 async def _ask_user(ctx: dict[str, Any], material_id: int, question: str) -> None:
