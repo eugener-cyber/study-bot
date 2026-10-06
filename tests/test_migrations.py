@@ -37,6 +37,18 @@ def _url(settings_url: str, name: str) -> str:
     return settings_url.rsplit("/", 1)[0] + "/" + name
 
 
+def _dsn(engine: AsyncEngine) -> str:
+    """URL движка со паролем.
+
+    `str(engine.url)` маскирует пароль как `***`, и первая версия этих тестов
+    подставляла на его место литерал `studybot`. Локально это работало, а в CI
+    пароль другой — четыре теста упали на «password authentication failed for
+    user ci». Поймал это CI, а не локальный прогон: ровно тот случай, ради
+    которого §41.4 требует, чтобы CI выполнял то же, что `make check`.
+    """
+    return engine.url.render_as_string(hide_password=False)
+
+
 @pytest_asyncio.fixture
 async def fresh_engine() -> AsyncIterator[AsyncEngine]:
     """Пустая база без схемы и без журнала миграций."""
@@ -69,7 +81,7 @@ async def _table_names(engine: AsyncEngine) -> set[str]:
 
 async def test_upgrade_creates_every_table(fresh_engine: AsyncEngine) -> None:
     """`upgrade head` на пустой базе даёт все таблицы §3."""
-    url = str(fresh_engine.url).replace("***", "studybot")
+    url = _dsn(fresh_engine)
     await run_alembic(url, "upgrade")
 
     names = await _table_names(fresh_engine)
@@ -83,7 +95,7 @@ async def test_every_revision_downgrades(fresh_engine: AsyncEngine) -> None:
     а не утверждением. Проверяется и обратное направление: база после
     `downgrade base` пуста, то есть откат не оставил половину схемы.
     """
-    url = str(fresh_engine.url).replace("***", "studybot")
+    url = _dsn(fresh_engine)
 
     await run_alembic(url, "upgrade")
     assert set(Base.metadata.tables) <= await _table_names(fresh_engine)
@@ -105,7 +117,7 @@ async def test_models_match_migrations(fresh_engine: AsyncEngine) -> None:
     `False`, и без явной записи расхождение в `DEFAULT` осталось бы
     незамеченным — а в §3 двадцать семь колонок с `DEFAULT`.
     """
-    url = str(fresh_engine.url).replace("***", "studybot")
+    url = _dsn(fresh_engine)
     await run_alembic(url, "upgrade")
 
     config = alembic_config(url)
@@ -126,7 +138,7 @@ async def test_check_detects_drift(fresh_engine: AsyncEngine) -> None:
     есть имитируется ровно тот случай, против которого проверка и ставится:
     схема изменилась мимо моделей.
     """
-    url = str(fresh_engine.url).replace("***", "studybot")
+    url = _dsn(fresh_engine)
     await run_alembic(url, "upgrade")
 
     async with fresh_engine.begin() as connection:
