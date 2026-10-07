@@ -90,8 +90,23 @@ class Settings(BaseSettings):
     NEW_FACT_DELAY_MIN: int = 10
     AWAITING_USER_TIMEOUT_H: int = 24
     MAX_INTERVAL_DAYS: int = 180
-    UNSUPPORTED_REPLY_COOLDOWN_SEC: int = 60
     LANG_CONFIDENCE_MIN: float = 0.8
+
+    RECOGNITION_ONLY_CAP: float = 0.7
+    """§14.1, CR-1. Потолок `score_i` для факта, по которому нет ни одного
+    верного ответа на порождающее задание (`open`).
+
+    Узнавание среди вариантов и воспроизведение по памяти — разные операции с
+    разной прочностью следа. Без этого потолка mastery показывала освоение,
+    которого нет: «освоено 85%» могло означать «узнаю среди четырёх».
+    Применяется в WP-16."""
+
+    GIVEUP_DELAY_SEC: int = 20
+    """§20, CR-4. Задержка кнопок «Подсказка» и «Не знаю» на открытом вопросе.
+
+    `0` возвращает прежнее поведение — кнопки сразу. Правка трогает ощущение
+    от продукта, поэтому выключается конфигурацией, а не правкой кода.
+    Применяется в WP-14."""
     COST_REESTIMATE_FACTOR: float = 1.5
 
     COST_WARN_THRESHOLD: Decimal | None = Field(default=None)

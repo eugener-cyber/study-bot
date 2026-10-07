@@ -1,11 +1,11 @@
 # Команды харнесса (План реализации §1.4). Всего там восемь целей; существуют
-# check (WP-01) и migrate/downgrade/reset (WP-02). Остальным нечем работать:
-# seed относится к WP-03, session и answer к WP-05, dump-material к WP-06,
+# check (WP-01), migrate/downgrade/reset (WP-02) и seed (WP-03). Остальным
+# нечем работать: session и answer относятся к WP-05, dump-material к WP-06,
 # evals к WP-07, cite к WP-11.
 
 PY := .venv/bin/python
 
-.PHONY: check lint type test install migrate downgrade reset
+.PHONY: check lint type test install migrate downgrade reset seed
 
 install:
 	python3 -m venv .venv
@@ -39,3 +39,10 @@ downgrade:
 reset:
 	$(PY) -m alembic downgrade base
 	$(PY) -m alembic upgrade head
+
+# Прогон материала через конвейер целиком (§1.4). Содержательные стадии на
+# заглушках до WP-04 — это и есть критерий приёмки WP-03.
+#   make seed FILE=путь/к/файлу.md
+seed:
+	@test -n "$(FILE)" || (echo "укажите FILE=путь/к/файлу"; exit 1)
+	$(PY) -m core.harness seed "$(FILE)"

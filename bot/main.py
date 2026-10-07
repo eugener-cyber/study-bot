@@ -16,11 +16,13 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.fsm.storage.redis import RedisStorage
+from arq import ArqRedis, create_pool
+from arq.connections import RedisSettings
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.errors import build_error_handler
-from bot.handlers import fallback, start
+from bot.handlers import gate, start, upload
 from bot.middlewares.auth import AuthMiddleware
 from bot.middlewares.db_session import DbSessionMiddleware
 from bot.middlewares.throttle import ThrottleMiddleware
@@ -37,6 +39,7 @@ def build_dispatcher(
     settings: Settings,
     redis: Redis,
     sessions: async_sessionmaker[AsyncSession] | None = None,
+    arq: ArqRedis | None = None,
 ) -> Dispatcher:
     """Собирает диспетчер: перехватчик ошибок, авторизация, троттлинг, роутеры.
 
@@ -84,10 +87,8 @@ def build_dispatcher(
         dispatcher.update.outer_middleware(DbSessionMiddleware(sessions))
 
     dispatcher.include_router(start.build_start_router())
-    # Последним: ловит всё, что не разобрали хендлеры выше (§19.4, переходное).
-    dispatcher.include_router(
-        fallback.build_fallback_router(redis, settings.UNSUPPORTED_REPLY_COOLDOWN_SEC)
-    )
+    dispatcher.include_router(gate.build_gate_router(arq))
+    dispatcher.include_router(upload.build_upload_router(arq))
     return dispatcher
 
 
@@ -105,6 +106,12 @@ async def run() -> None:
     engine = build_engine(settings.DATABASE_URL)
     sessions = build_sessionmaker(engine)
 
+    # Очередь обработки материалов. Отдельное подключение от FSM-хранилища:
+    # ARQ держит собственный пул и собственные ключи, и делить объект между
+    # двумя библиотеками значит зависеть от того, что ни одна не закроет его
+    # раньше другой.
+    arq = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+
     redis = Redis.from_url(settings.REDIS_URL)
     # Проверяем связь сразу: без Redis не работают ни FSM, ни троттлинг, и
     # падать лучше на старте, чем на первом сообщении пользователя.
@@ -112,7 +119,7 @@ async def run() -> None:
 
     session = AiohttpSession(api=TelegramAPIServer.from_base(LOCAL_BOT_API))
     bot = Bot(token=settings.BOT_TOKEN, session=session)
-    dispatcher = build_dispatcher(settings, redis, sessions)
+    dispatcher = build_dispatcher(settings, redis, sessions, arq)
 
     log.info("bot_starting", allowed_users=len(settings.ALLOWED_USER_IDS))
     try:
@@ -120,6 +127,7 @@ async def run() -> None:
     finally:
         await bot.session.close()
         await redis.aclose()
+        await arq.aclose()
         await engine.dispose()
 
 

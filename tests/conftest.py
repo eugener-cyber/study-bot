@@ -208,6 +208,31 @@ class NoopSession:
     async def rollback(self) -> None:
         return None
 
+    async def execute(self, *_: object, **__: object) -> _EmptyResult:
+        """Любой запрос даёт пустой результат.
+
+        Этого достаточно для тестов без базы: обработчики, спрашивающие
+        «есть ли такой пользователь», получают «нет» — а именно этот случай и
+        проверяется, когда согласие ещё не дано.
+        """
+        return _EmptyResult()
+
+
+class _EmptyResult:
+    """Пустой результат запроса для `NoopSession`."""
+
+    def scalar_one_or_none(self) -> None:
+        return None
+
+    def scalars(self) -> _EmptyResult:
+        return self
+
+    def all(self) -> list[object]:
+        return []
+
+    def first(self) -> None:
+        return None
+
 
 def noop_sessions() -> NoopSession:
     """Фабрика сессий-заглушек — для `build_dispatcher` в тестах без базы."""

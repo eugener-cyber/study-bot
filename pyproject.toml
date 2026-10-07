@@ -8,6 +8,9 @@ dependencies = [
     # alembic>=1.13 — нужна цель `alembic check` (появилась в 1.9), ею держится
     # правило «модели и миграции не расходятся» (План WP-02).
     "alembic>=1.13",
+    # ARQ, а не Celery: §1.4 ТЗ отвергает Celery прямо — «ARQ работает в том
+    # же asyncio-цикле без второго рантайма».
+    "arq>=0.26",
     "asyncpg>=0.30",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
@@ -31,7 +34,16 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["bot", "bot.middlewares", "bot.handlers", "core", "core.db", "core.services"]
+packages = [
+    "bot",
+    "bot.middlewares",
+    "bot.handlers",
+    "core",
+    "core.adapters",
+    "core.db",
+    "core.ingest",
+    "core.services",
+]
 
 [tool.ruff]
 line-length = 100
