@@ -17,12 +17,15 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.fsm.storage.redis import RedisStorage
 from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.errors import build_error_handler
 from bot.handlers import fallback, start
 from bot.middlewares.auth import AuthMiddleware
+from bot.middlewares.db_session import DbSessionMiddleware
 from bot.middlewares.throttle import ThrottleMiddleware
 from core.config import Settings, load_settings
+from core.db.engine import build_engine, build_sessionmaker
 from core.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -30,7 +33,11 @@ log = get_logger(__name__)
 LOCAL_BOT_API = "http://telegram-bot-api:8081"
 
 
-def build_dispatcher(settings: Settings, redis: Redis) -> Dispatcher:
+def build_dispatcher(
+    settings: Settings,
+    redis: Redis,
+    sessions: async_sessionmaker[AsyncSession] | None = None,
+) -> Dispatcher:
     """Собирает диспетчер: перехватчик ошибок, авторизация, троттлинг, роутеры.
 
     Перехват ошибок — обработчик наблюдателя `errors`, а не middleware. Свой
@@ -49,8 +56,13 @@ def build_dispatcher(settings: Settings, redis: Redis) -> Dispatcher:
     `event_from_user` на этом уровне уже заполнен: `UserContextMiddleware`
     стоит в очереди раньше.
 
-    Порядок внутри: auth -> throttle. Считать обращения постороннего не нужно,
-    он отклонён раньше.
+    Порядок внутри: auth -> throttle -> сессия БД. Считать обращения
+    постороннего не нужно, он отклонён раньше; открывать для него транзакцию и
+    занимать соединение из пула — тем более.
+
+    `sessions` необязателен: без него middleware сессии не регистрируется, и
+    хендлеры, объявляющие параметр `session`, упадут. Это сделано для тестов,
+    которым база не нужна, — а не для работы: `run()` фабрику передаёт всегда.
     """
     dispatcher = Dispatcher(storage=RedisStorage(redis=redis))
 
@@ -67,6 +79,9 @@ def build_dispatcher(settings: Settings, redis: Redis) -> Dispatcher:
             window_sec=settings.THROTTLE_WINDOW_SEC,
         )
     )
+
+    if sessions is not None:
+        dispatcher.update.outer_middleware(DbSessionMiddleware(sessions))
 
     dispatcher.include_router(start.build_start_router())
     # Последним: ловит всё, что не разобрали хендлеры выше (§19.4, переходное).
@@ -87,6 +102,9 @@ async def run() -> None:
     configure_logging()
     settings = load_settings()
 
+    engine = build_engine(settings.DATABASE_URL)
+    sessions = build_sessionmaker(engine)
+
     redis = Redis.from_url(settings.REDIS_URL)
     # Проверяем связь сразу: без Redis не работают ни FSM, ни троттлинг, и
     # падать лучше на старте, чем на первом сообщении пользователя.
@@ -94,7 +112,7 @@ async def run() -> None:
 
     session = AiohttpSession(api=TelegramAPIServer.from_base(LOCAL_BOT_API))
     bot = Bot(token=settings.BOT_TOKEN, session=session)
-    dispatcher = build_dispatcher(settings, redis)
+    dispatcher = build_dispatcher(settings, redis, sessions)
 
     log.info("bot_starting", allowed_users=len(settings.ALLOWED_USER_IDS))
     try:
@@ -102,6 +120,7 @@ async def run() -> None:
     finally:
         await bot.session.close()
         await redis.aclose()
+        await engine.dispose()
 
 
 if __name__ == "__main__":

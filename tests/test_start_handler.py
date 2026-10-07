@@ -19,6 +19,7 @@ from bot.handlers.start import (
     handle_consent,
     handle_start,
 )
+from tests.conftest import NoopSession
 from tests.test_dispatcher import TELEGRAM_NOT_MODIFIED
 
 
@@ -76,7 +77,7 @@ async def test_start_attaches_keyboard() -> None:
 
 
 @pytest.mark.asyncio
-async def test_consent_click_answers_and_edits_message() -> None:
+async def test_consent_click_answers_and_edits_message(no_consent_write: list[int]) -> None:
     """Нажатие подтверждается и экран правится на текст согласия.
 
     Имя теста прежде утверждало «without_db» и этим закрывало процедуру
@@ -87,26 +88,26 @@ async def test_consent_click_answers_and_edits_message() -> None:
     inner = _message()
     callback = _callback(inner)
 
-    await handle_consent(callback)
+    await handle_consent(callback, NoopSession())  # type: ignore[arg-type]
 
     callback.answer.assert_awaited_once()  # type: ignore[attr-defined]
     inner.edit_text.assert_awaited_once_with(CONSENT_ACCEPTED)  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_repeat_click_on_already_accepted_screen_is_noop() -> None:
+async def test_repeat_click_on_already_accepted_screen_is_noop(no_consent_write: list[int]) -> None:
     """Обычное повторное нажатие: текст уже правленый, править нечего."""
     inner = _message(text=CONSENT_ACCEPTED)
     callback = _callback(inner)
 
-    await handle_consent(callback)
+    await handle_consent(callback, NoopSession())  # type: ignore[arg-type]
 
     callback.answer.assert_awaited_once()  # type: ignore[attr-defined]
     inner.edit_text.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_double_tap_race_does_not_show_failure_to_user() -> None:
+async def test_double_tap_race_does_not_show_failure_to_user(no_consent_write: list[int]) -> None:
     """Быстрый двойной тап: оба callback пришли до применения правки.
 
     Telegram отвечает «message is not modified», и до правки это доходило до
@@ -116,11 +117,12 @@ async def test_double_tap_race_does_not_show_failure_to_user() -> None:
     inner = _message()
     inner.edit_text.side_effect = _not_modified()  # type: ignore[attr-defined]
 
-    await handle_consent(_callback(inner))  # не должно поднять исключение
+    # Не должно поднять исключение.
+    await handle_consent(_callback(inner), NoopSession())  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
-async def test_other_bad_request_is_not_swallowed() -> None:
+async def test_other_bad_request_is_not_swallowed(no_consent_write: list[int]) -> None:
     """Гасится ровно один случай, а не любая ошибка правки сообщения."""
     inner = _message()
     inner.edit_text.side_effect = TelegramBadRequest(  # type: ignore[attr-defined]
@@ -129,7 +131,7 @@ async def test_other_bad_request_is_not_swallowed() -> None:
     )
 
     with pytest.raises(TelegramBadRequest):
-        await handle_consent(_callback(inner))
+        await handle_consent(_callback(inner), NoopSession())  # type: ignore[arg-type]
 
 
 def test_consent_text_mentions_storage() -> None:
@@ -137,11 +139,19 @@ def test_consent_text_mentions_storage() -> None:
     assert "матери" in GREETING and "хран" in GREETING
 
 
-def test_todo_points_at_wp02_issue() -> None:
-    """Отложенная запись согласия обязана иметь тикет и владельца (костыль п. 10)."""
+def test_deferred_consent_todo_is_closed() -> None:
+    """`TODO(#2)` снят: запись согласия реализована в WP-02.
+
+    Тест был обратным — проверял наличие TODO с тикетом и владельцем (костыль
+    п. 10). Теперь проверяет, что TODO ушёл вместе с причиной. Обязательство
+    «должны получить `consent_at` миграцией WP-02» снято и здесь, и в
+    `STATE.md`: иначе пакет закрылся бы с документированным обещанием,
+    которого не выполнял.
+    """
     source = Path(__file__).resolve().parents[1] / "bot" / "handlers" / "start.py"
     text = source.read_text(encoding="utf-8")
-    assert "TODO(#2, owner:" in text
+    assert "TODO" not in text, "TODO вернулся в обработчик согласия"
+    assert "accept_consent" in text, "запись согласия не вызывается"
 
 
 def test_keyboard_has_single_button() -> None:

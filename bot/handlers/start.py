@@ -2,9 +2,10 @@
 
 ТЗ §31: согласие фиксируется при первом запуске (`users.consent_at`).
 
-Здесь согласие показывается и нажатие обрабатывается, но в базу не пишется:
-таблицы `users` до WP-02 не существует. Перенос согласован как CR-B, следы —
-TODO ниже, строка в STATE.md и блок «Перенесено из WP-01» в Issue #2.
+Запись в базу появилась в WP-02 вместе с таблицей `users` — перенос был
+согласован как CR-B и здесь закрыт. Хендлер её не делает сам: по §35 в
+хендлере только разбор апдейта, вызов сервиса и рендер, а запись выполняет
+`core/services/users.py`.
 """
 
 from __future__ import annotations
@@ -13,8 +14,10 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.logging import get_logger
+from core.services.users import accept_consent
 
 log = get_logger(__name__)
 
@@ -65,15 +68,17 @@ async def handle_start(message: Message) -> None:
     await message.answer(GREETING, reply_markup=consent_keyboard())
 
 
-async def handle_consent(callback: CallbackQuery) -> None:
-    """Обрабатывает нажатие кнопки согласия.
+async def handle_consent(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Обрабатывает нажатие кнопки согласия и записывает его.
 
-    TODO(#2, owner: eugener-cyber): записать `users.consent_at` (ТЗ §31).
-    Таблица `users` появляется в WP-02 — Issue #2, блок «Перенесено из WP-01».
-    До тех пор согласие принимается, но не сохраняется; пользователи, нажавшие
-    кнопку в WP-01, должны получить `consent_at` миграцией WP-02.
+    Запись идёт до ответа пользователю: если она упадёт, человек увидит
+    безопасное сообщение (§31) и не получит «Готово, согласие принято» при
+    незаписанном согласии. Обратный порядок давал бы ответ об успехе при
+    пустом `consent_at`.
     """
     user_id = callback.from_user.id if callback.from_user else None
+    if user_id is not None:
+        await accept_consent(session, user_id)
     log.info("consent_accepted", user_id=user_id)
 
     await callback.answer()

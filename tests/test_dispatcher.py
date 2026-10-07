@@ -29,6 +29,7 @@ from bot.handlers.fallback import REPLY
 from bot.handlers.start import CONSENT_CALLBACK, GREETING
 from bot.main import build_dispatcher
 from core.config import Settings
+from tests.conftest import noop_sessions
 
 ALLOWED_ID = 111
 OUTSIDER_ID = 999
@@ -94,6 +95,14 @@ class RecordingSession(BaseSession):
     def texts(self) -> list[str]:
         """Тексты отправленных сообщений."""
         return [c.text for c in self.calls if isinstance(c, SendMessage)]
+
+    def edits(self) -> list[str]:
+        """Тексты правок сообщений — отдельно от отправленных.
+
+        Нужны, потому что ответ на нажатие кнопки идёт правкой экрана, а не
+        новым сообщением: проверка по `replies()` его не видит.
+        """
+        return [c.text or "" for c in self.calls if isinstance(c, EditMessageText)]
 
     def replies(self) -> list[str]:
         """Всё, что пользователь увидит: и сообщения, и алерты на callback.
@@ -344,7 +353,7 @@ def _consent_update(user_id: int, update_id: int) -> Update:
     )
 
 
-async def test_double_consent_click_shows_no_failure() -> None:
+async def test_double_consent_click_shows_no_failure(no_consent_write: list[int]) -> None:
     """Сквозная проверка FAIL 2.2 на собранном диспетчере.
 
     `RecordingSession` воспроизводит поведение Telegram: вторая правка на тот
@@ -353,10 +362,12 @@ async def test_double_consent_click_shows_no_failure() -> None:
     успешно принятом согласии.
     """
     bot, session = _bot()
-    dispatcher = build_dispatcher(_settings(), _redis())
+    dispatcher = build_dispatcher(_settings(), _redis(), noop_sessions)  # type: ignore[arg-type]
 
     await dispatcher.feed_update(bot, _consent_update(ALLOWED_ID, 10))
     await dispatcher.feed_update(bot, _consent_update(ALLOWED_ID, 11))
+
+    assert no_consent_write == [ALLOWED_ID, ALLOWED_ID], "согласие не доходило до сервиса"
 
     # Положительный ассерт: столкновение действительно произошло. Остальные
     # проверки имеют форму «плохого не случилось» и выполняются, когда опасная
