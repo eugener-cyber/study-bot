@@ -31,7 +31,7 @@ from core.llm.base import (
     SchemaError,
     TokenUsage,
 )
-from core.llm.client import SCHEMA_RETRY_HEADER, LLMClient, RetryPolicy
+from core.llm.client import SCHEMA_RETRY_HEADER, CallRecord, LLMClient, RetryPolicy
 from core.llm.estimation import PRICING_VERSION
 from core.llm.recording import LLMMode, recording_key, save
 from core.llm.schemas import SectionsAnswer
@@ -529,3 +529,93 @@ async def test_record_mode_still_calls_the_provider_and_accounts_for_it(
 
     assert len(provider.prompts) == 1
     assert len(recorder.rows) == 1
+
+
+# --- Сбой самого учёта ----------------------------------------------------
+
+
+class BrokenRecorder:
+    """Recorder, который всегда падает. Достижимо: перезапуск Postgres."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    async def record(self, record: CallRecord) -> None:
+        self.attempts += 1
+        raise RuntimeError("база учёта недоступна")
+
+
+async def test_recording_failure_does_not_cut_the_retries() -> None:
+    """Сбой учёта не меняет правил §6.1.
+
+    Нашло ревью PR #27: `_record_failure` вызывался внутри `except
+    ProviderError`, и исключение recorder'а уходило наружу **до** решения о
+    повторе. Следствие: гарантия «до 4 попыток» молча зависела от доступности
+    базы учёта, а наружу шла не та ошибка — «база учёта недоступна» вместо
+    429, причём без строки в `llm_calls`.
+
+    Ассерт на число обращений к провайдеру, а не на отсутствие исключения:
+    второе прошло бы и при реализации, которая гасит ошибку recorder'а, но
+    выходит из цикла.
+    """
+    provider = ScriptedProvider(failures=[ProviderUnavailableError("429")] * 2)
+    recorder = BrokenRecorder()
+
+    result = await fake_client(_settings(), provider=provider, recorder=recorder).structured(
+        PROMPT, SectionsAnswer, purpose="sections", prompt_version="v1"
+    )
+
+    assert result.value.sections
+    assert len(provider.prompts) == 3
+    assert recorder.attempts == 3
+
+
+async def test_recording_failure_does_not_discard_a_paid_answer() -> None:
+    """Успешный путь: ответ уже получен и уже оплачен.
+
+    Выбросить его из-за того, что не записалась строка о нём, — худший из
+    возможных обменов.
+    """
+    recorder = BrokenRecorder()
+    result = await fake_client(
+        _settings(), provider=ScriptedProvider(), recorder=recorder
+    ).structured(PROMPT, SectionsAnswer, purpose="sections", prompt_version="v1")
+
+    assert result.value.sections
+    assert recorder.attempts == 1
+
+
+async def test_the_original_provider_error_still_reaches_the_caller() -> None:
+    """Исчерпав попытки, наружу уходит ошибка провайдера, а не учёта.
+
+    Диагностика по подменённой ошибке ведёт в соседнюю подсистему: причина
+    отказа материала — 429, а не недоступность базы учёта.
+    """
+    provider = ScriptedProvider(failures=[ProviderUnavailableError("429 от провайдера")] * 4)
+
+    with pytest.raises(ProviderUnavailableError, match="429 от провайдера"):
+        await fake_client(_settings(), provider=provider, recorder=BrokenRecorder()).structured(
+            PROMPT, SectionsAnswer, purpose="sections", prompt_version="v1"
+        )
+
+
+async def test_lost_row_is_logged_with_its_whole_content(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Потеря строки учёта не молчаливая: число восстановимо из журнала.
+
+    Это и есть та уступка §6.4, которой оплачена независимость ретраев от
+    базы учёта. Без содержимого в логе уступка была бы просто потерей: §6.4
+    получил бы провал в истории, а восстановить его было бы нечем.
+    """
+    provider = ScriptedProvider(name="anthropic", usage=TokenUsage(1234, 567))
+    await fake_client(
+        _settings(LLM_PROVIDER="anthropic"), provider=provider, recorder=BrokenRecorder()
+    ).structured(PROMPT, SectionsAnswer, purpose="sections", prompt_version="sections_v1")
+
+    printed = capsys.readouterr().out
+    assert "llm_call_not_recorded" in printed
+    assert "1234" in printed
+    assert "567" in printed
+    assert "sections_v1" in printed
+    assert "база учёта недоступна" in printed

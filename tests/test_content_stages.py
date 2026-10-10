@@ -28,6 +28,7 @@ from core.ingest import handlers as h
 from core.ingest.handlers import UNASSIGNED_TITLE, WARNING_MARK, norm_hash, render_note
 from core.ingest.pipeline import StageContext
 from core.llm.client import DatabaseRecorder
+from core.llm.schemas import SectionsAnswer
 from core.storage import MaterialStorage
 from tests.llm_fakes import ScriptedProvider, fake_client
 from tests.test_dispatcher import _settings
@@ -743,3 +744,62 @@ async def test_llm_calls_rows_carry_the_material_and_user(
     assert rows
     assert all(int(material) == material_id for material, _ in rows)
     assert all(user is not None for _, user in rows)
+
+
+async def test_accounting_row_survives_a_failing_stage(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """Стадия упала **после** вызова — строка учёта осталась. §6.4.
+
+    Это свойство, ради которого `DatabaseRecorder` открывает свою сессию, и
+    до ревью PR #27 оно не было проверено ни одним тестом: оба теста про
+    `llm_calls` шли по успешному пути, где откатывать нечего. Мутация
+    «recorder пишет в сессию стадии» прошла бы незамеченной.
+
+    Сценарий достижим и наблюдался на живом прогоне `make seed`: ответ для
+    первой секции был готов, для второй нет, стадия `facts` упала, факты
+    первой секции откатились — а строка о сделанном вызове осталась. Иначе
+    §6.4 терял бы расход на вызовы, результат которых не сохранился, то есть
+    ровно те, за которые заплачено зря.
+
+    Проверяется в обе стороны: своя запись стадии исчезла, строка учёта
+    осталась. Без первой половины тест прошёл бы и при транзакции, которая
+    вообще не откатывается.
+    """
+    material_id = await _material(engine)
+    client = fake_client(
+        _settings(),
+        provider=ScriptedProvider(name="manual"),
+        recorder=DatabaseRecorder(sessions),
+    )
+
+    with pytest.raises(RuntimeError, match="стадия упала"):
+        async with session_scope(sessions) as session:
+            await client.structured(
+                "[1] текст фрагмента",
+                SectionsAnswer,
+                purpose="sections",
+                prompt_version="sections_v1",
+                material_id=material_id,
+            )
+            session.add(
+                Section(
+                    material_id=material_id,
+                    ord=1,
+                    title="Секция, которой не будет",
+                    summary_md="",
+                    fragment_ids=[1],
+                )
+            )
+            await session.flush()
+            raise RuntimeError("стадия упала после вызова модели")
+
+    sections = await _rows(engine, select(Section.title).where(Section.material_id == material_id))
+    calls = await _rows(
+        engine, select(LlmCall.purpose, LlmCall.ok).where(LlmCall.material_id == material_id)
+    )
+    assert sections == [], "запись стадии не откатилась — тест проверяет не то, что должен"
+    assert [(str(purpose), bool(ok)) for purpose, ok in calls] == [("sections", True)]

@@ -404,7 +404,7 @@ class LLMClient:
         user_id: int | None,
         material_id: int | None,
     ) -> None:
-        await self._recorder.record(
+        await self._write(
             CallRecord(
                 purpose=purpose,
                 prompt_version=prompt_version,
@@ -446,7 +446,7 @@ class LLMClient:
         usage = error.usage or TokenUsage(
             input_tokens=estimate.input_tokens, output_tokens=0, estimated=True
         )
-        await self._recorder.record(
+        await self._write(
             CallRecord(
                 purpose=purpose,
                 prompt_version=prompt_version,
@@ -465,6 +465,60 @@ class LLMClient:
                 material_id=material_id,
             )
         )
+
+    async def _write(self, record: CallRecord) -> None:
+        """Пишет строку учёта так, чтобы её сбой не менял исход вызова.
+
+        **Решение, а не упущение, и оно требует обоснования.** Учёт §6.4 —
+        бухгалтерия вокруг вызова, а правила ретраев §6.1 описывают поведение
+        **провайдера**. Если исключение recorder'а уходило бы наружу из блока
+        `except ProviderError`, гарантия «до 4 попыток» молча зависела бы от
+        доступности базы учёта: перезапуск Postgres превращал бы первый же 429
+        в окончательный отказ материала. Нашло ревью PR #27 прогоном с
+        падающим recorder'ом: обращений к провайдеру 1 вместо 3.
+
+        Хуже того, наружу уходила бы не та ошибка. Пользователь получает
+        «обработка не удалась», в логе стоит «база учёта недоступна», а
+        настоящая причина — 429 провайдера — теряется вместе с попытками.
+
+        На успешном пути цена ещё выше: уже полученный и **уже оплаченный**
+        ответ модели выбрасывался бы из-за того, что не записалась строка о
+        нём.
+
+        **Уступка §6.4, которую это создаёт, названа прямо:** строка учёта
+        может быть потеряна. Поэтому потеря не молчаливая — в журнал уходит
+        `llm_call_not_recorded` **со всем содержимым строки**, то есть число
+        восстановимо из логов, пока они живы. Это компромисс в пользу
+        обработки материала против полноты учёта, и обратный выбор сделал бы
+        продукт неработоспособным при любом сбое соседней подсистемы.
+
+        Перехватывается `Exception`, а не `BaseException`: `CancelledError`
+        при остановке воркера должен проходить наружу, иначе задача не
+        отменяется.
+        """
+        try:
+            await self._recorder.record(record)
+        except Exception as error:
+            log.error(
+                "llm_call_not_recorded",
+                reason=str(error),
+                reason_type=type(error).__name__,
+                purpose=record.purpose,
+                prompt_version=record.prompt_version,
+                provider=record.provider,
+                model=record.model,
+                pricing_version=record.pricing_version,
+                input_tokens=record.input_tokens,
+                output_tokens=record.output_tokens,
+                cost_currency=record.cost_currency,
+                estimated_cost=str(record.estimated_cost),
+                actual_cost=str(record.actual_cost),
+                latency_ms=record.latency_ms,
+                ok=record.ok,
+                call_error=record.error,
+                user_id=record.user_id,
+                material_id=record.material_id,
+            )
 
     def _cost(self, usage: TokenUsage) -> Decimal:
         return self._prices.cost(usage.input_tokens, usage.output_tokens)
