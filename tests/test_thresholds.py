@@ -30,7 +30,17 @@ RENAMED = {
 # (окно 1M), уточняется при смене провайдера» — число есть, и разбор берёт
 # его первым. Самый дорогой по последствиям порог §30.3 был исключён из
 # сверки без причины (ревью PR #3, FAIL 3.3).
-NON_NUMERIC = {"COST_WARN_THRESHOLD", "COST_CURRENCY"}
+# `LLM_MODE` — `replay` | `record` | `live`, значение строковое (v3.13, CR-N).
+NON_NUMERIC = {"COST_WARN_THRESHOLD", "COST_CURRENCY", "LLM_MODE"}
+
+TODO_IN_SPEC = {"COST_WARN_THRESHOLD"}
+"""Пороги, у которых в §30.3 стоит `TODO(owner)`, а в конфиге `None`.
+
+Выделены отдельно, чтобы «нечисловой» не стало лазейкой: всё остальное из
+`NON_NUMERIC` сверяется по тексту ячейки. Ровно так один раз уже потерялся
+`MAX_SECTION_TOKENS` — самый дорогой по последствиям порог §30.3 был исключён
+из сверки без причины (ревью PR #3, FAIL 3.3).
+"""
 
 
 def _spec_thresholds() -> dict[str, str]:
@@ -135,3 +145,29 @@ def test_threshold_value_matches_spec(name: str, raw: str) -> None:
     expected = float(numbers[0])
     actual = float(Settings.model_fields[field_name].default)  # type: ignore[arg-type]
     assert actual == expected, f"{name}: в ТЗ {expected}, в конфиге {actual}"
+
+
+@pytest.mark.parametrize("name", sorted(NON_NUMERIC - TODO_IN_SPEC))
+def test_non_numeric_default_appears_in_the_spec_cell(name: str) -> None:
+    """Строковое умолчание конфига названо в той же строке §30.3.
+
+    Пропуск по признаку «значение нечисловое» иначе снимал бы проверку вовсе,
+    и `LLM_MODE = "live"` в конфиге прошёл бы при `replay` в спецификации —
+    то есть продукт по умолчанию ходил бы в сеть, а ТЗ обещало обратное.
+    """
+    raw = _spec_thresholds()[name]
+    default = Settings.model_fields[RENAMED.get(name, name)].default
+    assert isinstance(default, str)
+    assert default in raw, f"{name}: в конфиге {default!r}, в §30.3 «{raw}»"
+
+
+@pytest.mark.parametrize("name", sorted(TODO_IN_SPEC))
+def test_todo_threshold_is_unset_in_configuration(name: str) -> None:
+    """`TODO(owner)` в §30.3 означает `None` в конфиге, а не выдуманное число.
+
+    Подставленное «разумное» значение выглядело бы выведенным из спайка,
+    которого не было, и гейт §6.3 срабатывал бы по числу, за которое никто не
+    отвечает.
+    """
+    assert "TODO" in _spec_thresholds()[name]
+    assert Settings.model_fields[RENAMED.get(name, name)].default is None
