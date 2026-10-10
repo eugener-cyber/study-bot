@@ -19,13 +19,17 @@ extract  -> fragments × average_size × coefficients   -> уточнённая
 
 **Про числа.** §6.3 называет «коэффициенты стадий», но нигде их не задаёт, а
 `COST_WARN_THRESHOLD` в §30.3 стоит как `TODO(owner)` и выводится из спайка
-(§34.1), который не выполнялся — ключа провайдера нет. Поэтому здесь:
+(§34.1), который не выполнялся — ключа провайдера нет. Поэтому:
 
-- цены за токен взяты из §2.1, где они указаны прямо: $5 и $25 за миллион
-  токенов входа и выхода на `claude-opus-5`;
-- расход токенов по стадиям — **предварительные** коэффициенты, собранные в
-  одном месте с выводом каждого числа. После спайка они переезжают в §30.3,
-  как и требует преамбула «константы конфигурации, а не литералы в коде»;
+- коэффициенты стадий и цены за токен живут в `core/llm/estimation.py`, а не
+  здесь. В WP-03 они были здесь, и это было неверным направлением
+  зависимости: их второй потребитель — клиент LLM (§6.4, оценка и факт по
+  каждому вызову), и он тянул бы за собой весь пакет обработки материала.
+  Направление `ingest → llm` правильное: оценка стоимости материала законно
+  зависит от цен и объёмов вызовов модели, а не наоборот;
+- цена берётся по **провайдеру из настроек**, а не по `anthropic` жёстко: в
+  режиме `manual` вызовов нет, цена нулевая (§2.1), и оценка в деньгах
+  честно обращается в ноль, тогда как оценка в токенах остаётся осмысленной;
 - пока `COST_WARN_THRESHOLD` не задан, гейт **не срабатывает**, и это
   записано явно: молчаливое срабатывание на `None` остановило бы обработку
   любого материала.
@@ -41,53 +45,10 @@ from decimal import Decimal
 
 from core.adapters.base import SourceMeta
 from core.config import Settings
+from core.llm.estimation import ProviderPrices, StageCoefficients, prices_for
 from core.logging import get_logger
 
 log = get_logger(__name__)
-
-
-@dataclass(frozen=True)
-class StageCoefficients:
-    """Расход токенов по стадиям. **Предварительные значения.**
-
-    Каждое число — оценка сверху с выводом, а не угаданное. Уточняются спайком
-    (§34.1) и после него переезжают в §30.3.
-    """
-
-    text_tokens_per_page: int = 500
-    """Страница учебного текста. Выведено из размера страницы A4 плотного
-    текста: около 2500 символов, около пяти символов на токен для русского."""
-
-    vision_input_per_page: int = 1600
-    """Сканированная страница в vision-вызове: изображение занимает порядка
-    1500 токенов входа плюс промпт. Главный множитель стоимости — §5.2."""
-
-    vision_output_per_page: int = 500
-    """Распознанный текст страницы на выходе."""
-
-    audio_tokens_per_minute: int = 150
-    """Минута речи в транскрипте: около 130 слов, около 1.2 токена на слово."""
-
-    sections_output_ratio: float = 0.05
-    """Выход стадии `sections` к объёму входа: заголовки и границы."""
-
-    facts_output_ratio: float = 0.30
-    """Выход стадии `facts`: утверждение и разбор на каждый факт."""
-
-    notes_output_ratio: float = 0.25
-    """Выход стадии `notes`: конспект короче источника."""
-
-    questions_output_ratio: float = 0.60
-    """Выход стадии `questions`: два-четыре задания на факт с дистракторами —
-    самая многословная стадия."""
-
-
-@dataclass(frozen=True)
-class Prices:
-    """Цены за миллион токенов. Взяты из §2.1 для `claude-opus-5`."""
-
-    input_per_million: Decimal = Decimal("5")
-    output_per_million: Decimal = Decimal("25")
 
 
 @dataclass(frozen=True)
@@ -118,20 +79,12 @@ class CostEstimate:
         }
 
 
-def _cost(input_tokens: int, output_tokens: int, prices: Prices) -> Decimal:
-    million = Decimal(1_000_000)
-    return (
-        Decimal(input_tokens) * prices.input_per_million / million
-        + Decimal(output_tokens) * prices.output_per_million / million
-    )
-
-
 def estimate_from_probe(
     meta: SourceMeta,
     settings: Settings,
     *,
     coefficients: StageCoefficients | None = None,
-    prices: Prices | None = None,
+    prices: ProviderPrices | None = None,
 ) -> CostEstimate:
     """Предварительная оценка по результату `probe`. Основание гейта (§6.3).
 
@@ -140,7 +93,7 @@ def estimate_from_probe(
     по нему видно, что оценка предварительная.
     """
     coefficients = coefficients or StageCoefficients()
-    prices = prices or Prices()
+    prices = prices or prices_for(settings.LLM_PROVIDER)
 
     pages = meta.pages or 0
     vision_pages = round(pages * meta.vision_pages_ratio)
@@ -165,10 +118,11 @@ def estimate_from_probe(
     output_tokens = vision_pages * coefficients.vision_output_per_page
 
     # Содержательные стадии читают весь материал и пишут долю от него.
+    # Их три, а не четыре: конспект §8 собирается из фактов без вызова
+    # модели (решение Архитектора v3.13, CR-O).
     for ratio in (
         coefficients.sections_output_ratio,
         coefficients.facts_output_ratio,
-        coefficients.notes_output_ratio,
         coefficients.questions_output_ratio,
     ):
         input_tokens += source_tokens
@@ -177,7 +131,7 @@ def estimate_from_probe(
     return CostEstimate(
         fragments=0,
         est_tokens=input_tokens + output_tokens,
-        est_cost=_cost(input_tokens, output_tokens, prices),
+        est_cost=prices.cost(input_tokens, output_tokens),
         currency=settings.COST_CURRENCY,
         coefficients=coefficients,
     )
@@ -189,7 +143,7 @@ def estimate_after_extract(
     settings: Settings,
     *,
     coefficients: StageCoefficients | None = None,
-    prices: Prices | None = None,
+    prices: ProviderPrices | None = None,
 ) -> CostEstimate:
     """Уточнённая оценка по фактическому числу фрагментов (§6.3).
 
@@ -199,14 +153,13 @@ def estimate_after_extract(
     стало известно, сколько текста в материале на самом деле.
     """
     coefficients = coefficients or StageCoefficients()
-    prices = prices or Prices()
+    prices = prices or prices_for(settings.LLM_PROVIDER)
 
     input_tokens = 0
     output_tokens = 0
     for ratio in (
         coefficients.sections_output_ratio,
         coefficients.facts_output_ratio,
-        coefficients.notes_output_ratio,
         coefficients.questions_output_ratio,
     ):
         input_tokens += fragment_tokens
@@ -215,7 +168,7 @@ def estimate_after_extract(
     return CostEstimate(
         fragments=fragments,
         est_tokens=input_tokens + output_tokens,
-        est_cost=_cost(input_tokens, output_tokens, prices),
+        est_cost=prices.cost(input_tokens, output_tokens),
         currency=settings.COST_CURRENCY,
         coefficients=coefficients,
     )

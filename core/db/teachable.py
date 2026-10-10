@@ -67,3 +67,55 @@ def teachable_fact_ids(min_confidence: float) -> Select[tuple[int]]:
     """
     subquery = teachable_facts_select(min_confidence).subquery()
     return select(subquery.c.fact_id)
+
+
+_QUALITY = "(SELECT MIN(fr.quality) FROM fragments fr WHERE fr.id = ANY(f.fragment_ids))"
+"""Минимальное качество фрагментов факта — второй множитель §7.3.
+
+Вынесено строкой, потому что встречается в выборке дважды: в выражении
+`final_confidence` и в условии порога. Два текста одного подзапроса рано или
+поздно разошлись бы, и условие стало бы отбирать по одному числу, а
+возвращать другое.
+"""
+
+_GENERATABLE = text(
+    "SELECT f.id AS fact_id, f.material_id, f.section_id, "
+    f"(f.confidence * COALESCE({_QUALITY}, 0::real))::real AS final_confidence "
+    "FROM facts f "
+    "WHERE NOT COALESCE(f.suspended, false) "
+    "  AND NOT COALESCE(f.derived, false) "
+    f"  AND (f.confidence * {_QUALITY}) >= CAST(:min_confidence AS real)"
+).columns(
+    fact_id=BigInteger,
+    material_id=BigInteger,
+    section_id=BigInteger,
+    final_confidence=REAL,
+)
+
+
+def generatable_facts_select(min_confidence: float) -> TextualSelect:
+    """Факты, по которым **можно генерировать** вопросы. §7.3 проверки 3 и 4.
+
+    Это не то же, что обучаемость, и разница существенна. `teachable_facts`
+    требует наличия хотя бы одного вопроса со статусом `valid` — для
+    планировщика и статистики это правильно: факт без вопросов выдать нельзя.
+    Но стадия генерации вопросов работает **до** их появления, и предикат
+    обучаемости на этом шаге пуст по построению: ни по одному факту вопросов
+    ещё нет, и генерировать было бы не по чему.
+
+    Поэтому здесь ровно две проверки §7.3: `final_confidence` не ниже порога
+    (проверка 3 — «вопросы по нему не генерируются») и `derived = false`
+    (проверка 4 — выведенные факты не участвуют в SRS, а вопрос существует
+    только ради SRS). Остальные условия обучаемости к генерации не относятся.
+
+    Связь двух предикатов держит тест, а не соглашение: разница между ними
+    обязана быть ровно множеством фактов без валидных вопросов. Иначе при
+    правке одного второй молча начнёт отбирать другое, и факты либо получат
+    вопросы, но не попадут в расписание, либо наоборот.
+
+    `generation_status` в условии не участвует намеренно. Значение
+    `unavailable` означает, что вопросы сделать не удалось; запрещать повторную
+    попытку значило бы делать отказ окончательным, тогда как §12.2 обещает
+    перегенерацию, а §38 №19 — возврат факта в ротацию.
+    """
+    return _GENERATABLE.bindparams(bindparam("min_confidence", value=min_confidence))

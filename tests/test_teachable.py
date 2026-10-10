@@ -497,3 +497,134 @@ def test_threshold_not_inlined_by_consumers() -> None:
             if pattern in path.read_text(encoding="utf-8"):
                 offenders.append(relative)
     assert not offenders, f"{pattern} вызывается напрямую в: {offenders}"
+
+
+# --- Группа 5: отбор на генерацию вопросов (§7.3 проверки 3 и 4) -----------
+
+
+async def _generatable_ids(engine: AsyncEngine, threshold: float) -> set[int]:
+    from core.db.teachable import generatable_facts_select
+
+    async with engine.connect() as connection:
+        result = await connection.execute(generatable_facts_select(threshold))
+        return {int(row.fact_id) for row in result}
+
+
+async def test_generatable_differs_from_teachable_exactly_by_valid_questions(
+    engine: AsyncEngine, clean_tables: None
+) -> None:
+    """Два предиката связаны, и связь держится проверкой, а не соглашением.
+
+    `teachable_facts` требует валидного вопроса — для планировщика и
+    статистики это правильно: факт без вопросов выдать нельзя. Стадия
+    генерации работает **до** их появления, и обучаемость на этом шаге пуста
+    по построению.
+
+    Разница обязана быть ровно множеством фактов без валидных вопросов. Иначе
+    при правке одного второй молча начнёт отбирать другое, и факты либо
+    получат вопросы, но не попадут в расписание, либо наоборот — то есть
+    сломается §4.6 или §16, а причина будет в соседнем предикате.
+    """
+    section_id, material_id = await _scaffold(engine)
+    fragment_id = await _fragment(engine, material_id, 1.0)
+
+    with_question = await _fact(
+        engine, section_id, material_id, fragment_ids=[fragment_id], confidence=0.9
+    )
+    await _question(engine, with_question, "valid")
+    without_question = await _fact(
+        engine, section_id, material_id, fragment_ids=[fragment_id], confidence=0.9
+    )
+
+    teachable = await _teachable_ids(engine, 0.55)
+    generatable = await _generatable_ids(engine, 0.55)
+
+    assert teachable == {with_question}
+    assert generatable == {with_question, without_question}
+    assert generatable - teachable == {without_question}
+
+
+@pytest.mark.parametrize(
+    "derived,confidence,expected",
+    [
+        (False, 0.9, True),
+        (True, 0.9, False),
+        (False, 0.1, False),
+        (False, 0.55, True),
+    ],
+    ids=["годный", "вывод-модели", "ниже-порога", "ровно-на-пороге"],
+)
+async def test_generatable_applies_checks_3_and_4_of_7_3(
+    engine: AsyncEngine, clean_tables: None, derived: bool, confidence: float, expected: bool
+) -> None:
+    """§7.3: ниже порога — вопросы не генерируются; `derived` — не участвует в SRS.
+
+    Случай «ровно на пороге» обязателен отдельной строкой: сравнение в
+    `double precision` вместо `real` даёт на нём ложь, и это тот же дефект,
+    который ловился в WP-02 на порогах 0.65, 0.7 и 0.9.
+    """
+    section_id, material_id = await _scaffold(engine)
+    fragment_id = await _fragment(engine, material_id, 1.0)
+    fact_id = await _fact(
+        engine,
+        section_id,
+        material_id,
+        fragment_ids=[fragment_id],
+        confidence=confidence,
+        derived=derived,
+    )
+
+    assert (fact_id in await _generatable_ids(engine, 0.55)) is expected
+
+
+async def test_generatable_ignores_generation_status(
+    engine: AsyncEngine, clean_tables: None
+) -> None:
+    """Факт со статусом `unavailable` остаётся кандидатом на перегенерацию.
+
+    Запрет означал бы, что отказ окончателен, тогда как §12.2 обещает
+    перегенерацию, а §38 №19 — возврат факта в ротацию автоматически.
+    Обучаемость этот статус исключает, и правильно: без вопросов факт выдать
+    нельзя. Два предиката расходятся здесь намеренно.
+    """
+    section_id, material_id = await _scaffold(engine)
+    fragment_id = await _fragment(engine, material_id, 1.0)
+    fact_id = await _fact(
+        engine,
+        section_id,
+        material_id,
+        fragment_ids=[fragment_id],
+        confidence=0.9,
+        generation_status="unavailable",
+    )
+    await _question(engine, fact_id, "valid")
+
+    assert fact_id in await _generatable_ids(engine, 0.55)
+    assert fact_id not in await _teachable_ids(engine, 0.55)
+
+
+async def test_generatable_excludes_suspended_and_evidenceless_facts(
+    engine: AsyncEngine, clean_tables: None
+) -> None:
+    """Приостановленный факт и факт без evidence вопросов не получают.
+
+    Второй — защита И-1: генерировать вопрос по утверждению, которое ничем не
+    подтверждено, значит создать задание, разбор которого невозможно
+    сослать на источник.
+    """
+    section_id, material_id = await _scaffold(engine)
+    fragment_id = await _fragment(engine, material_id, 1.0)
+
+    suspended = await _fact(
+        engine,
+        section_id,
+        material_id,
+        fragment_ids=[fragment_id],
+        confidence=0.9,
+        suspended=True,
+    )
+    evidenceless = await _fact(engine, section_id, material_id, fragment_ids=[], confidence=0.9)
+
+    generatable = await _generatable_ids(engine, 0.55)
+    assert suspended not in generatable
+    assert evidenceless not in generatable

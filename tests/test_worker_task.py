@@ -154,10 +154,21 @@ async def test_successful_task_reaches_ready(
     всегда.
     """
     import worker
+    from core.ingest import handlers as h
+    from tests.llm_fakes import fake_client
 
     material_id = await _material(engine)
     monkeypatch.setattr(
         worker, "fragments_from_text_or_stub", lambda path: StubAdapter()._fragments
+    )
+    # Провайдер подменяется целиком, а не `LLM_PROVIDER` в настройках:
+    # `manual` без подготовленного человеком содержания поднимает
+    # `ManualContentMissingError`, и это его правильное поведение — тест о
+    # пути задачи, а не о ручном режиме.
+    monkeypatch.setattr(
+        worker,
+        "stage_handlers",
+        lambda settings, sessions: h.build_handlers(fake_client(settings), settings),
     )
 
     result = await worker.process_material_task(

@@ -3,6 +3,12 @@
 `test_budget.py` проверяет арифметику, здесь — что гейт **подключён** и
 останавливает обработку в нужный момент. Разница существенная: правильный
 расчёт, не вызванный из конвейера, прошёл бы все тесты первого файла.
+
+Настройки берутся с `LLM_PROVIDER="anthropic"`: с WP-04 цены берутся по
+провайдеру, а у `manual` они нулевые (§2.1, вызовов нет). На нулевых ценах
+гейт не срабатывает никогда, и проверка его подключения выродилась бы в
+проверку того, что ничего не произошло. Вырожденность ручного режима проверяется
+отдельно — `test_budget.py::test_manual_provider_*`.
 """
 
 from __future__ import annotations
@@ -85,7 +91,7 @@ async def test_gate_stops_before_extract(
     Вторая формулировка прошла бы и при гейте, поставленном после `extract`, —
     то есть при том дефекте, из-за которого §6.3 переписывался в v3.5.
     """
-    settings = _settings(COST_WARN_THRESHOLD="0.01")
+    settings = _settings(COST_WARN_THRESHOLD="0.01", LLM_PROVIDER="anthropic")
     material_id = await _material(engine)
     adapter = _adapter(pages=500, vision=1.0)
 
@@ -105,7 +111,7 @@ async def test_gate_parks_material_with_a_question(
     цифры — без них выбор между «обработать полностью» и «только конспект»
     делается наугад (§6.3).
     """
-    settings = _settings(COST_WARN_THRESHOLD="0.01")
+    settings = _settings(COST_WARN_THRESHOLD="0.01", LLM_PROVIDER="anthropic")
     material_id = await _material(engine)
 
     with pytest.raises(AwaitingUser) as raised:
@@ -139,7 +145,7 @@ async def test_estimate_is_saved_even_when_gate_does_not_fire(
     §6.4 сравнивает оценку с фактическим расходом, и материал без оценки
     выпал бы из этого сравнения незаметно.
     """
-    settings = _settings()
+    settings = _settings(LLM_PROVIDER="anthropic")
     material_id = await _material(engine)
 
     await probe_and_gate(sessions, material_id, _adapter(), "stub://x", settings)
@@ -164,7 +170,7 @@ async def test_gate_does_not_fire_without_threshold(
     выполнялся. Срабатывание на `None` остановило бы любой материал — продукт
     не работал бы вовсе до получения ключа провайдера.
     """
-    settings = _settings()
+    settings = _settings(LLM_PROVIDER="anthropic")
     assert settings.COST_WARN_THRESHOLD is None
     material_id = await _material(engine)
 

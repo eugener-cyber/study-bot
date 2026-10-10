@@ -26,6 +26,7 @@ from core.ingest import handlers as h
 from core.ingest.pipeline import StageContext, StageHandler, process_material, run_stage
 from core.ingest.stages import ORDER, next_stage, reopen_for_questions
 from core.storage import MaterialStorage
+from tests.llm_fakes import fake_client
 from tests.test_dispatcher import _settings
 
 pytestmark = pytest.mark.db
@@ -34,14 +35,15 @@ NOW = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
 
 
 def _handlers() -> dict[str, StageHandler]:
-    return {
-        "extract": h.extract,
-        "sections": h.sections_stub,
-        "facts": h.facts_stub,
-        "notes": h.notes_stub,
-        "questions": h.questions_stub,
-        "schedule": h.make_schedule_handler(_settings()),
-    }
+    """Карта стадий та же, что в работе, — с подделкой провайдера внутри.
+
+    Собирается через `build_handlers`, а не перечислением: иначе стадия,
+    добавленная в работе, осталась бы непроверенной здесь, а тесты
+    возобновления параметризованы по `ORDER` и прошли бы на недостающем
+    обработчике как на пропущенной стадии.
+    """
+    settings = _settings()
+    return h.build_handlers(fake_client(settings), settings)
 
 
 def _adapter(count: int = 3) -> StubAdapter:

@@ -25,6 +25,7 @@ from aiogram.client.telegram import TelegramAPIServer
 from arq import cron
 from arq.connections import RedisSettings
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.handlers.gate import gate_keyboard
 from bot.main import LOCAL_BOT_API
@@ -40,6 +41,7 @@ from core.ingest.awaiting import expire_stale, progress_message_id
 from core.ingest.gate import probe_and_gate, reestimate_after_extract
 from core.ingest.pipeline import AwaitingUser, StageHandler, process_material
 from core.ingest.stages import EXTRACT
+from core.llm.factory import build_client
 from core.logging import configure_logging, get_logger
 from core.services.materials import mark_failed, mark_ready
 from core.storage import MaterialStorage
@@ -50,16 +52,16 @@ MATERIALS_ROOT = "./data/materials"
 QUEUE_NAME = "studybot:ingest"
 
 
-def stage_handlers(settings: Settings) -> dict[str, StageHandler]:
-    """Обработчики стадий. Содержательные — заглушки до WP-04."""
-    return {
-        "extract": h.extract,
-        "sections": h.sections_stub,
-        "facts": h.facts_stub,
-        "notes": h.notes_stub,
-        "questions": h.questions_stub,
-        "schedule": h.make_schedule_handler(settings),
-    }
+def stage_handlers(
+    settings: Settings, sessions: async_sessionmaker[AsyncSession]
+) -> dict[str, StageHandler]:
+    """Обработчики стадий §4.2 с клиентом LLM.
+
+    `sessions` нужны не стадиям, а учёту: `DatabaseRecorder` пишет строку
+    `llm_calls` в своей транзакции, чтобы падение стадии не отменяло откатом
+    запись об уже оплаченных вызовах (урок WP-03 с `AwaitingUser`).
+    """
+    return h.build_handlers(build_client(settings, sessions), settings)
 
 
 async def process_material_task(ctx: dict[str, Any], material_id: int, source_path: str) -> str:
@@ -82,6 +84,12 @@ async def process_material_task(ctx: dict[str, Any], material_id: int, source_pa
         # Гейт бюджета — ДО конвейера, а не внутри. §6.3: для сканированного
         # PDF `extract` это vision-вызов на каждую страницу, и гейт после него
         # спрашивал бы «обрабатывать?» после того, как деньги потрачены.
+        # Карта стадий строится один раз на задачу. Два вызова `stage_handlers`
+        # дали бы два клиента, то есть два независимых семафора
+        # `LLM_CONCURRENCY`, и предел параллелизма §6.1 оказался бы вдвое
+        # выше заявленного — молча, потому что каждый из них соблюдает свой.
+        handlers = stage_handlers(settings, sessions)
+
         preliminary = await probe_and_gate(sessions, material_id, adapter, source_path, settings)
 
         # Извлечение отдельно от остальных стадий: сразу после него оценка
@@ -92,7 +100,7 @@ async def process_material_task(ctx: dict[str, Any], material_id: int, source_pa
         await process_material(
             sessions,
             storage,
-            stage_handlers(settings),
+            handlers,
             material_id,
             adapter,
             source_path,
@@ -104,7 +112,7 @@ async def process_material_task(ctx: dict[str, Any], material_id: int, source_pa
         await process_material(
             sessions,
             storage,
-            stage_handlers(settings),
+            handlers,
             material_id,
             adapter,
             source_path,
