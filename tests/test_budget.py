@@ -1,7 +1,11 @@
-"""Оценка стоимости и гейт. ТЗ §6.3.
+"""Оценка стоимости и гейт бюджета. ТЗ §6.3.
 
-Без базы: здесь проверяется арифметика и условия срабатывания. Связка с
-конвейером — в тестах конвейера.
+**Про `LLM_PROVIDER="anthropic"` в тестах стоимости.** Цены берутся по
+провайдеру из настроек, а у `manual` они нулевые (§2.1): вызовов нет, платить
+нечего. Поэтому любая проверка, сравнивающая **суммы**, на умолчании тестов
+выродилась бы в `0 < 0` и прошла бы при полностью сломанном расчёте. Проверки
+стоимости поэтому идут на платном провайдере, а вырожденность ручного режима
+проверяется отдельно и называется прямо — см. `test_manual_provider_*`.
 """
 
 from __future__ import annotations
@@ -11,13 +15,13 @@ from decimal import Decimal
 from core.adapters.base import SourceMeta
 from core.ingest.budget import (
     CostEstimate,
-    StageCoefficients,
     estimate_after_extract,
     estimate_from_probe,
     exceeds_threshold,
     gate_question,
     needs_reestimate_confirmation,
 )
+from core.llm.estimation import StageCoefficients
 from tests.test_dispatcher import _settings
 
 
@@ -28,7 +32,7 @@ def test_scanned_pages_cost_more_than_text_pages() -> None:
     страница требует vision-вызова, то есть основной статьи расхода, и
     спрашивать после неё поздно.
     """
-    settings = _settings()
+    settings = _settings(LLM_PROVIDER="anthropic")
     text = estimate_from_probe(SourceMeta(pages=100, vision_pages_ratio=0.0), settings)
     scanned = estimate_from_probe(SourceMeta(pages=100, vision_pages_ratio=1.0), settings)
 
@@ -47,7 +51,7 @@ def test_preliminary_estimate_has_no_fragments() -> None:
 
 
 def test_estimate_grows_with_size() -> None:
-    settings = _settings()
+    settings = _settings(LLM_PROVIDER="anthropic")
     small = estimate_from_probe(SourceMeta(pages=10), settings)
     large = estimate_from_probe(SourceMeta(pages=300), settings)
     assert large.est_cost > small.est_cost * 20
@@ -67,7 +71,7 @@ def test_plain_text_without_pages_is_counted_by_chars() -> None:
     Без этой ветки такой материал получал бы нулевую оценку, то есть проходил
     бы гейт при любом объёме.
     """
-    settings = _settings()
+    settings = _settings(LLM_PROVIDER="anthropic")
     estimate = estimate_from_probe(SourceMeta(text_chars=500_000), settings)
     assert estimate.est_tokens > 0
     assert estimate.est_cost > 0
@@ -100,7 +104,7 @@ def test_refined_estimate_excludes_vision() -> None:
     потраченное, мы сравнивали бы расход со суммой, в которую этот расход
     входит дважды.
     """
-    settings = _settings()
+    settings = _settings(LLM_PROVIDER="anthropic")
     scanned = estimate_from_probe(SourceMeta(pages=50, vision_pages_ratio=1.0), settings)
     refined = estimate_after_extract(fragments=50, fragment_tokens=25_000, settings=settings)
     assert refined.est_cost < scanned.est_cost
@@ -129,7 +133,7 @@ def test_gate_is_disabled_while_threshold_is_unset() -> None:
 
 
 def test_gate_fires_once_threshold_is_set() -> None:
-    settings = _settings(COST_WARN_THRESHOLD="1.00")
+    settings = _settings(COST_WARN_THRESHOLD="1.00", LLM_PROVIDER="anthropic")
     huge = estimate_from_probe(SourceMeta(pages=1000, vision_pages_ratio=1.0), settings)
     small = estimate_from_probe(SourceMeta(pages=1), settings)
     assert exceeds_threshold(huge, settings) is True
@@ -211,7 +215,7 @@ def test_coefficients_are_overridable() -> None:
     задаёт, и после спайка §34.1 они переедут в §30.3. Возможность подменить
     их — то, что делает этот переезд правкой одного места.
     """
-    settings = _settings()
+    settings = _settings(LLM_PROVIDER="anthropic")
     cheap = StageCoefficients(text_tokens_per_page=1)
     expensive = StageCoefficients(text_tokens_per_page=10_000)
     meta = SourceMeta(pages=10)
@@ -220,3 +224,36 @@ def test_coefficients_are_overridable() -> None:
         estimate_from_probe(meta, settings, coefficients=cheap).est_cost
         < estimate_from_probe(meta, settings, coefficients=expensive).est_cost
     )
+
+
+def test_manual_provider_gives_zero_cost_and_nonzero_tokens() -> None:
+    """Ручной режим: стоимость ноль, объём не ноль. §2.1, ADR-0005.
+
+    Это не особенность теста, а поведение продукта в том режиме, в котором он
+    сейчас работает, и оно должно быть названо проверкой. Ноль в деньгах
+    верен: вызова не было. Ноль в токенах был бы неверен: материал через слой
+    прошёл, и §6.4 обязан показывать объём работы за весь ручной период.
+
+    Отсюда следствие, записанное в ADR-0005: коридор §6.4 считается на
+    токенах. На стоимости он в этом режиме невычислим — `0 / 0`.
+    """
+    estimate = estimate_from_probe(SourceMeta(pages=10), _settings(LLM_PROVIDER="manual"))
+
+    assert estimate.est_cost == Decimal("0")
+    assert estimate.est_tokens > 0
+
+
+def test_manual_provider_disables_the_cost_gate_even_with_threshold() -> None:
+    """При нулевых ценах гейт §6.3 не срабатывает даже при заданном пороге.
+
+    Проверка на вырожденность, а не на желаемое поведение: предупреждать о
+    сумме, которой нет, бессмысленно, но знать об этом нужно — оператор,
+    выставивший `COST_WARN_THRESHOLD` в ручном режиме, вправе ожидать, что
+    порог работает. Вопрос «нужен ли гейт на токенах» вынесен Архитектору
+    change request'ом; до решения поведение зафиксировано здесь.
+    """
+    settings = _settings(COST_WARN_THRESHOLD="0.01", LLM_PROVIDER="manual")
+    estimate = estimate_from_probe(SourceMeta(pages=10_000), settings)
+
+    assert estimate.est_tokens > 1_000_000
+    assert exceeds_threshold(estimate, settings) is False

@@ -118,7 +118,7 @@ async def seed(file_path: str, tg_id: int | None = None) -> int:
         await process_material(
             sessions,
             storage,
-            _handlers(settings),
+            _handlers(settings, sessions),
             material_id,
             adapter,
             str(path.resolve()),
@@ -133,18 +133,15 @@ async def seed(file_path: str, tg_id: int | None = None) -> int:
     return material_id
 
 
-def _handlers(settings: object) -> dict[str, StageHandler]:
+def _handlers(settings: object, sessions: object) -> dict[str, StageHandler]:
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
     from core.config import Settings
+    from core.llm.factory import build_client
 
     assert isinstance(settings, Settings)
-    return {
-        "extract": h.extract,
-        "sections": h.sections_stub,
-        "facts": h.facts_stub,
-        "notes": h.notes_stub,
-        "questions": h.questions_stub,
-        "schedule": h.make_schedule_handler(settings),
-    }
+    assert isinstance(sessions, async_sessionmaker)
+    return h.build_handlers(build_client(settings, sessions), settings)
 
 
 async def _ensure_user(session: object, tg_id: int) -> int:
