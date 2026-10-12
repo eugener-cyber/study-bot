@@ -304,9 +304,7 @@ async def test_only_valid_questions_are_selected(
     await add_question(engine, fact_id, status=status)
 
     async with sessions() as session:
-        chosen = await select_question(
-            session, fact_id, last_q_type=None, last_direction=None
-        )
+        chosen = await select_question(session, fact_id, last_q_type=None, last_direction=None)
 
     assert chosen is None
 
@@ -323,8 +321,6 @@ async def test_open_question_is_not_selected_by_default(
     await add_question(engine, fact_id, question_type="open", direction="forward")
 
     async with sessions() as session:
-        chosen = await select_question(
-            session, fact_id, last_q_type=None, last_direction=None
-        )
+        chosen = await select_question(session, fact_id, last_q_type=None, last_direction=None)
 
     assert chosen is None

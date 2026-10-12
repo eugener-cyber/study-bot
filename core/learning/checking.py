@@ -21,7 +21,7 @@ from typing import Any, Final
 from core.learning.rating import Verdict
 
 
-class InvalidAnswer(Exception):
+class InvalidAnswerError(Exception):
     """Ответ не разобрать: неизвестный тип, нет варианта, вариант вне диапазона.
 
     Отдельное исключение, а не вердикт `wrong`: §13.2 превращает `wrong` в
@@ -66,11 +66,11 @@ def check_mcq(
 
     option = raw.get("option")
     if not isinstance(option, int):
-        raise InvalidAnswer(f"в ответе нет варианта: {dict(raw)!r}")
+        raise InvalidAnswerError(f"в ответе нет варианта: {dict(raw)!r}")
 
     options = payload.get("options") or []
     if not 0 <= option < len(options):
-        raise InvalidAnswer(f"вариант вне диапазона: {option} при {len(options)} вариантах")
+        raise InvalidAnswerError(f"вариант вне диапазона: {option} при {len(options)} вариантах")
 
     verdict: Verdict = "correct" if option == correct else "wrong"
     return CheckResult(verdict=verdict, correct_option=correct)
@@ -99,10 +99,10 @@ def check_answer(
 ) -> CheckResult:
     """Проверяет ответ обработчиком своего типа.
 
-    Неизвестный тип — `InvalidAnswer`, а не «неверно»: см. докстроку
+    Неизвестный тип — `InvalidAnswerError`, а не «неверно»: см. докстроку
     исключения.
     """
     checker = CHECKERS.get(question_type)
     if checker is None:
-        raise InvalidAnswer(f"на задание типа {question_type!r} ответ ещё не проверяется")
+        raise InvalidAnswerError(f"на задание типа {question_type!r} ответ ещё не проверяется")
     return checker(payload, answer, raw)

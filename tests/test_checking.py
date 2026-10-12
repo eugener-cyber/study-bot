@@ -12,7 +12,7 @@ import pytest
 from core.learning.checking import (
     ANSWERABLE_TYPES,
     CHECKERS,
-    InvalidAnswer,
+    InvalidAnswerError,
     check_answer,
 )
 
@@ -26,7 +26,7 @@ def test_answerable_types_are_exactly_the_registry_keys() -> None:
     Ассерт на равенство ключам, а не на литерал: литерал проверяет следующий
     тест, а этот — что второго списка типов в коде нет.
     """
-    assert ANSWERABLE_TYPES == frozenset(CHECKERS)
+    assert frozenset(CHECKERS) == ANSWERABLE_TYPES
 
 
 def test_only_mcq_is_answerable_in_this_package() -> None:
@@ -36,7 +36,7 @@ def test_only_mcq_is_answerable_in_this_package() -> None:
     `match_text` и `match_image` — в WP-14 вместе с интерфейсом. Этот ассерт
     упадёт, если тип попал в реестр без обработчика ответа.
     """
-    assert ANSWERABLE_TYPES == frozenset({"mcq"})
+    assert frozenset({"mcq"}) == ANSWERABLE_TYPES
     assert "open" not in ANSWERABLE_TYPES
 
 
@@ -70,12 +70,12 @@ def test_option_out_of_range_is_rejected() -> None:
     ничто не мешает. Засчитать это как неверный ответ значило бы испортить
     расписание факта по чужому запросу.
     """
-    with pytest.raises(InvalidAnswer):
+    with pytest.raises(InvalidAnswerError):
         check_answer("mcq", MCQ_PAYLOAD, MCQ_ANSWER, {"option": 7})
 
 
 def test_answer_without_option_is_rejected() -> None:
-    with pytest.raises(InvalidAnswer):
+    with pytest.raises(InvalidAnswerError):
         check_answer("mcq", MCQ_PAYLOAD, MCQ_ANSWER, {})
 
 
@@ -85,5 +85,5 @@ def test_unanswerable_type_is_rejected_loudly() -> None:
     Это вторая половина защиты: даже если такой вопрос как-то попал в сессию,
     молчаливого «неверно» не будет.
     """
-    with pytest.raises(InvalidAnswer, match="open"):
+    with pytest.raises(InvalidAnswerError, match="open"):
         check_answer("open", {"question": "?"}, {"reference": "митоз"}, {"text": "митоз"})

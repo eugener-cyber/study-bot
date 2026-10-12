@@ -36,7 +36,7 @@ class Rating(IntEnum):
 def rating_for(
     verdict: str,
     *,
-    latency_ms: int,
+    latency_ms: int | None,
     reps: int,
     fast_ms: int,
     slow_ms: int,
@@ -52,6 +52,11 @@ def rating_for(
     Соотнесения (§13.2, «менее половины пар — Again, от половины — Hard»)
     здесь не трактуются: вердикт `partial` уже несёт этот результат, а считает
     пары проверка ответа §21.1 — WP-14, где появляется сам тип задания.
+
+    `latency_ms = None` означает «время неизвестно»: момент выдачи не записан.
+    Тогда оба условия на скорость не применяются, и верный ответ даёт Good.
+    Подставлять ноль было бы хуже — он означает «ответил мгновенно» и выдавал
+    бы Easy за пропавшую отметку времени.
     """
     if verdict not in VERDICTS:
         raise ValueError(f"неизвестный вердикт: {verdict!r}")
@@ -60,6 +65,8 @@ def rating_for(
         return Rating.AGAIN
     if verdict == "partial":
         return Rating.HARD
+    if latency_ms is None:
+        return Rating.GOOD
     if latency_ms > slow_ms:
         return Rating.HARD
     if latency_ms < fast_ms and reps > 2:

@@ -123,9 +123,7 @@ class FixedIntervalScheduler:
     def version(self) -> str:
         return STUB_VERSION
 
-    def review(
-        self, snapshot: ReviewSnapshot, rating: Rating, *, now: datetime
-    ) -> ReviewOutcome:
+    def review(self, snapshot: ReviewSnapshot, rating: Rating, *, now: datetime) -> ReviewOutcome:
         interval = STUB_INTERVALS[rating]
         forgotten = rating is Rating.AGAIN and snapshot.reps > 0
         elapsed = (now - snapshot.last_review).days if snapshot.last_review else 0

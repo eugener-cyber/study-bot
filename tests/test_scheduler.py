@@ -19,7 +19,9 @@ MAX_INTERVAL_DAYS = 180
 """§30.3: `MAX_INTERVAL_DAYS` = 180. Литерал намеренно."""
 
 
-def _snapshot(*, reps: int = 3, lapses: int = 0, last_review: datetime | None = None) -> ReviewSnapshot:
+def _snapshot(
+    *, reps: int = 3, lapses: int = 0, last_review: datetime | None = None
+) -> ReviewSnapshot:
     return ReviewSnapshot(
         reps=reps,
         lapses=lapses,
@@ -69,9 +71,7 @@ def test_longest_interval_stays_within_the_ceiling(scheduler: FixedIntervalSched
     Заглушка его не вычисляет, но и не нарушает: проверка стоит здесь, чтобы
     правка интервалов «на подольше» не прошла молча.
     """
-    longest = max(
-        scheduler.review(_snapshot(), rating, now=NOW).due_at for rating in Rating
-    )
+    longest = max(scheduler.review(_snapshot(), rating, now=NOW).due_at for rating in Rating)
     assert longest - NOW <= timedelta(days=MAX_INTERVAL_DAYS)
 
 
@@ -120,9 +120,7 @@ def test_stub_invents_neither_stability_nor_difficulty_nor_state(
 
 def test_elapsed_days_counts_from_last_review(scheduler: FixedIntervalScheduler) -> None:
     """`elapsed_days` в журнале §3 — промежуток с прошлого ответа."""
-    outcome = scheduler.review(
-        _snapshot(last_review=NOW - timedelta(days=4)), Rating.GOOD, now=NOW
-    )
+    outcome = scheduler.review(_snapshot(last_review=NOW - timedelta(days=4)), Rating.GOOD, now=NOW)
     assert outcome.elapsed_days == 4
 
 

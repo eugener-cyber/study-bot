@@ -19,9 +19,7 @@ SLOW_MS = 45000
 
 
 def _rating(verdict: str, *, latency_ms: int = 20000, reps: int = 5) -> Rating:
-    return rating_for(
-        verdict, latency_ms=latency_ms, reps=reps, fast_ms=FAST_MS, slow_ms=SLOW_MS
-    )
+    return rating_for(verdict, latency_ms=latency_ms, reps=reps, fast_ms=FAST_MS, slow_ms=SLOW_MS)
 
 
 def test_spec_thresholds_match_settings() -> None:
@@ -89,3 +87,24 @@ def test_unknown_verdict_is_an_error_not_a_silent_again() -> None:
     """
     with pytest.raises(ValueError, match="вердикт"):
         _rating("almost")
+
+
+def test_unknown_latency_gives_good_not_easy() -> None:
+    """Время неизвестно — ни быстро, ни медленно.
+
+    Отметка времени выдачи может отсутствовать: сессия, собранная до
+    перезапуска, могла быть показана версией кода без неё. Подстановка нуля
+    означала бы «ответил мгновенно» и выдавала бы Easy за пропавшую отметку,
+    то есть удлиняла интервал на ошибке учёта.
+    """
+    assert (
+        rating_for("correct", latency_ms=None, reps=9, fast_ms=FAST_MS, slow_ms=SLOW_MS)
+        is Rating.GOOD
+    )
+
+
+def test_unknown_latency_does_not_rescue_a_wrong_answer() -> None:
+    assert (
+        rating_for("wrong", latency_ms=None, reps=9, fast_ms=FAST_MS, slow_ms=SLOW_MS)
+        is Rating.AGAIN
+    )
