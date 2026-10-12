@@ -59,7 +59,17 @@ def check_mcq(
     `skipped`, а не `wrong`: рейтинг у них одинаковый (§13.2), но в журнале
     они различаются, и на этой разнице стоят метрики §25.
     """
-    correct = int(answer["correct_index"])
+    stored = answer.get("correct_index")
+    if not isinstance(stored, int) or isinstance(stored, bool):
+        # Испорченная строка вопроса: §9.2 требует `correct_index`, а §11.1
+        # относит проверку его границ к валидатору WP-10. До него такие строки
+        # в базе есть — например, заглушки стадий из WP-03, оставшиеся до
+        # подключения настоящих вызовов. Падать `KeyError` здесь нельзя:
+        # наружу это выходит как «что-то сломалось», и причина теряется.
+        raise InvalidAnswerError(
+            f"в вопросе нет correct_index: {dict(answer)!r} — строка испорчена (§9.2)"
+        )
+    correct = stored
 
     if raw.get("idk"):
         return CheckResult(verdict="skipped", correct_option=correct)

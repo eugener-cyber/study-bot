@@ -19,6 +19,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 
 LLM = ROOT / "core" / "llm"
+LEARNING = ROOT / "core" / "learning"
 HANDLERS = ROOT / "core" / "ingest" / "handlers.py"
 
 
@@ -90,3 +91,42 @@ def test_prompt_files_are_not_embedded_in_code() -> None:
     source = HANDLERS.read_text(encoding="utf-8")
     assert "load_prompt" in source
     assert "Ответ — JSON по схеме" not in source
+
+
+@pytest.mark.parametrize("module", sorted(LEARNING.glob("*.py")), ids=lambda path: path.name)
+def test_learning_layer_knows_nothing_about_telegram_or_ingest(module: Path) -> None:
+    """Направление зависимости — `bot → core.services → core.learning`.
+
+    Педагогический слой не должен знать ни способа, которым задание попало к
+    человеку, ни конвейера обработки материала. Иначе консольный путь §1.4
+    («почти все проверки „Готово, если“ выполняются через харнесс») перестал
+    бы существовать: любая проверка планировщика тянула бы aiogram.
+
+    `core.services` в запрете тоже: сервис вызывает слой, а не наоборот.
+    Обратный импорт дал бы цикл — `services.sessions` импортирует
+    `learning.planner` ради `PLANNER_VERSION` и `plan_items`.
+    """
+    forbidden = ("aiogram", "bot", "core.ingest", "core.services", "arq")
+    offending = {
+        name
+        for name in _imports(module)
+        if any(name == item or name.startswith(f"{item}.") for item in forbidden)
+    }
+    assert not offending, f"{module.name} импортирует {sorted(offending)}"
+
+
+def test_planner_uses_the_teachable_wrapper_not_the_sql_function() -> None:
+    """§38 №18 в той части, которая доказуема в WP-05.
+
+    Свойство целиком («предикат один и тот же в трёх местах») доказуемо только
+    в WP-16, когда появится знаменатель coverage. Здесь проверяется то, что
+    доступно: планировщик — второй потребитель — берёт предикат обёрткой из
+    `core/db/teachable.py`, а не пишет собственное условие.
+
+    `test_threshold_not_inlined_by_consumers` в `tests/test_teachable.py`
+    запрещает прямой вызов SQL-функции по всему `core/`; этот тест — про
+    обратное: что обёртка действительно импортирована. Без него планировщик
+    мог бы собрать своё условие на `facts` и пройти оба запрета.
+    """
+    imported = _imports(LEARNING / "planner.py")
+    assert "core.db.teachable" in imported, "планировщик не берёт предикат §14.3 из обёртки"

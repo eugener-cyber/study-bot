@@ -87,3 +87,25 @@ def test_unanswerable_type_is_rejected_loudly() -> None:
     """
     with pytest.raises(InvalidAnswerError, match="open"):
         check_answer("open", {"question": "?"}, {"reference": "митоз"}, {"text": "митоз"})
+
+
+def test_mcq_without_correct_index_is_rejected_loudly() -> None:
+    """Испорченная строка вопроса даёт `InvalidAnswerError`, а не `KeyError`.
+
+    Найдено живым прогоном `make answer`: в базе разработчика остались строки
+    эпохи заглушек WP-03, у которых в `answer` нет `correct_index`. `KeyError`
+    из такой строки выходит наружу как «что-то сломалось», и причина
+    теряется; проверка границ самого индекса — §11.1 и валидатор WP-10.
+    """
+    with pytest.raises(InvalidAnswerError, match="correct_index"):
+        check_answer("mcq", MCQ_PAYLOAD, {}, {"option": 0})
+
+
+def test_mcq_with_boolean_correct_index_is_rejected() -> None:
+    """`True` — это `int` в Python, но не номер варианта.
+
+    Без явной проверки `bool` ответ «вариант 1» на такой строке считался бы
+    верным: `True == 1`.
+    """
+    with pytest.raises(InvalidAnswerError, match="correct_index"):
+        check_answer("mcq", MCQ_PAYLOAD, {"correct_index": True}, {"option": 1})
