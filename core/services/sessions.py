@@ -186,6 +186,23 @@ async def create_session(
     return session_id
 
 
+async def session_of_item(session: AsyncSession, item_id: int, *, user_id: int) -> int | None:
+    """Сессия задания, если она принадлежит этому человеку, иначе `None`.
+
+    `user_id` стоит в условии, а не проверяется после выборки: идентификатор
+    задания приходит из `callback_data`, то есть от клиента (§19.1), и чужая
+    сессия не должна быть видна даже номером.
+    """
+    found = (
+        await session.execute(
+            select(SessionItem.session_id)
+            .join(Session, Session.id == SessionItem.session_id)
+            .where(SessionItem.id == item_id, Session.user_id == user_id)
+        )
+    ).scalar_one_or_none()
+    return int(found) if found is not None else None
+
+
 async def set_control_message(session: AsyncSession, session_id: int, message_id: int) -> None:
     """Запоминает сообщение с клавиатурой текущего задания. §20, §3.
 

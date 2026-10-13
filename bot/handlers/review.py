@@ -25,12 +25,10 @@ from datetime import UTC, datetime
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.callbacks import IDK, Ans
 from core.config import Settings
-from core.db.models import User
 from core.learning.checking import InvalidAnswerError
 from core.learning.explain import Explanation
 from core.learning.scheduler import FixedIntervalScheduler
@@ -43,8 +41,10 @@ from core.services.sessions import (
     assemble,
     current_item,
     mark_shown,
+    session_of_item,
     set_control_message,
 )
+from core.services.users import find_by_tg_id
 
 log = get_logger(__name__)
 
@@ -155,12 +155,17 @@ def render_summary(summary: SessionSummary) -> str:
 async def _user_id(session: AsyncSession, tg_id: int) -> int | None:
     """Внутренний идентификатор по Telegram id.
 
+    Через сервис, а не запросом здесь: §35 и конвенция проекта не дают
+    хендлерам читать таблицы напрямую, а `find_by_tg_id` уже существует и уже
+    вызывается приёмом файла (`bot/handlers/upload.py`). Третья копия той же
+    выборки — п. 5 списка костылей.
+
     `None` означает, что человек ещё не давал согласия: строка `users`
     создаётся в момент согласия (§31, решение WP-02), и до него расписания у
     него нет по построению.
     """
-    found = (await session.execute(select(User.id).where(User.tg_id == tg_id))).scalar_one_or_none()
-    return int(found) if found is not None else None
+    user = await find_by_tg_id(session, tg_id)
+    return int(user.id) if user is not None else None
 
 
 async def handle_review(message: Message, session: AsyncSession, settings: Settings) -> None:
@@ -240,7 +245,7 @@ async def handle_answer(callback: CallbackQuery, session: AsyncSession, settings
     if result.finished or not isinstance(callback.message, Message):
         return
 
-    session_id = await _session_of(session, parsed.si)
+    session_id = await session_of_item(session, parsed.si, user_id=user_id)
     if session_id is None:  # pragma: no cover — элемент только что отвечен
         return
     item = await current_item(session, session_id)
@@ -283,15 +288,6 @@ async def _show_explanation(callback: CallbackQuery, result: AnswerResult) -> No
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=None)
     except Exception:
         log.info("explanation_not_edited", item_id=result.explanation.statement[:40])
-
-
-async def _session_of(session: AsyncSession, item_id: int) -> int | None:
-    from core.db.models import SessionItem
-
-    found = (
-        await session.execute(select(SessionItem.session_id).where(SessionItem.id == item_id))
-    ).scalar_one_or_none()
-    return int(found) if found is not None else None
 
 
 def build_review_router(settings: Settings) -> Router:
