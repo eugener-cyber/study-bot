@@ -33,7 +33,7 @@ from bot.callbacks import IDK, Ans
 from bot.progress import NOT_MODIFIED
 from core.config import Settings
 from core.learning.checking import InvalidAnswerError
-from core.learning.explain import Explanation
+from core.learning.explain import Explanation, format_duration
 from core.learning.scheduler import FixedIntervalScheduler
 from core.logging import get_logger
 from core.services.sessions import (
@@ -156,12 +156,10 @@ def render_summary(summary: SessionSummary) -> str:
     «К конспекту» здесь нет: mastery — WP-16, быстрое повторение — §27 и
     WP-17, конспект — §8.1 и WP-08.
     """
-    minutes, seconds = divmod(summary.seconds, 60)
-    spent = f"{minutes} мин {seconds} с" if minutes else f"{seconds} с"
     lines = [
         "<b>Сеанс завершён</b>",
         f"Счёт: {summary.correct} из {summary.total}",
-        f"Время: {spent}",
+        f"Время: {format_duration(summary.seconds)}",
     ]
     if summary.mistakes:
         lines.append("")

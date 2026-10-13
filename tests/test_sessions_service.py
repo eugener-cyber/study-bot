@@ -859,3 +859,100 @@ async def test_foreign_item_is_refused_before_the_answer_is_parsed(
 
     assert foreign is None, "чужое задание разобрано вместо отказа"
     assert missing is None
+
+
+async def test_answer_after_the_abandonment_threshold_ignores_the_stale_delay(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+    scheduler: FixedIntervalScheduler,
+) -> None:
+    """Простой дольше `ABANDON_AFTER_HOURS` не становится «медленным ответом».
+
+    Найдено живым прогоном WP-05: задание, выданное сутками раньше, дало
+    `latency` в 87 157 486 мс, §13.2 прочитал это как «верно, но дольше
+    `SLOW_MS`» и поставил Hard — расписание факта испортило время простоя, а
+    не ответ человека. §17.2 такой сеанс считает брошенным и FSRS менять не
+    даёт, но механизм — WP-13.
+
+    Решение Архитектора 2026-10-13: отвечать можно, рейтинг только по
+    правильности, `latency_ms` в журнале пустой.
+    """
+    base, session_id = await _ready_session(engine, sessions, settings)
+    stale = NOW - datetime.timedelta(hours=settings.ABANDON_AFTER_HOURS + 1)
+
+    async with sessions() as session:
+        item = await current_item(session, session_id)
+        assert item is not None
+        await mark_shown(session, item.item_id, user_id=base.user_id, now=stale)
+        await session.commit()
+
+    async with sessions() as session:
+        result = await answer_item(
+            session,
+            user_id=base.user_id,
+            item_id=item.item_id,
+            raw={"option": 0},
+            now=NOW,
+            settings=settings,
+            scheduler=scheduler,
+        )
+        await session.commit()
+
+    assert result is not None
+    assert result.rating is Rating.GOOD, "простой засчитан как медленный ответ"
+
+    async with sessions() as session:
+        latency = (
+            await session.execute(
+                select(ReviewLog.latency_ms).where(ReviewLog.fact_id == item.fact_id)
+            )
+        ).scalar_one()
+    assert latency is None
+
+
+async def test_slow_answer_inside_the_threshold_is_still_slow(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+    scheduler: FixedIntervalScheduler,
+) -> None:
+    """Вторая половина: обычная медлительность по-прежнему даёт Hard.
+
+    Без этого теста предыдущий прошёл бы и на реализации, которая выкинула
+    условие «дольше `SLOW_MS`» целиком, — то есть §13.2 перестал бы работать
+    вовсе.
+    """
+    base, session_id = await _ready_session(engine, sessions, settings)
+    inside = NOW - datetime.timedelta(hours=settings.ABANDON_AFTER_HOURS - 1)
+
+    async with sessions() as session:
+        item = await current_item(session, session_id)
+        assert item is not None
+        await mark_shown(session, item.item_id, user_id=base.user_id, now=inside)
+        await session.commit()
+
+    async with sessions() as session:
+        result = await answer_item(
+            session,
+            user_id=base.user_id,
+            item_id=item.item_id,
+            raw={"option": 0},
+            now=NOW,
+            settings=settings,
+            scheduler=scheduler,
+        )
+        await session.commit()
+
+    assert result is not None
+    assert result.rating is Rating.HARD, "медленный ответ внутри порога перестал быть медленным"
+
+    async with sessions() as session:
+        latency = (
+            await session.execute(
+                select(ReviewLog.latency_ms).where(ReviewLog.fact_id == item.fact_id)
+            )
+        ).scalar_one()
+    assert latency is not None and latency > settings.SLOW_MS

@@ -396,7 +396,7 @@ async def answer_item(
     session_id, question_id, fact_id, user_state, question_type, payload, answer = row
     check = check_answer(str(question_type), payload or {}, answer or {}, raw)
 
-    latency_ms = _latency_ms(user_state, now)
+    latency_ms = _latency_ms(user_state, now, abandon_after_hours=settings.ABANDON_AFTER_HOURS)
     state_row = (
         await session.execute(
             select(
@@ -601,12 +601,31 @@ async def _finish_if_complete(
     return True
 
 
-def _latency_ms(user_state: dict[str, Any] | None, now: datetime.datetime) -> int | None:
-    """Время от выдачи до ответа. `None`, если отметки выдачи нет.
+def _latency_ms(
+    user_state: dict[str, Any] | None,
+    now: datetime.datetime,
+    *,
+    abandon_after_hours: int,
+) -> int | None:
+    """Время от выдачи до ответа. `None`, если его нельзя считать осмысленным.
 
     `None`, а не ноль: ноль означает «ответил мгновенно» и по §13.2 давал бы
     Easy за пропавшую отметку времени — то есть удлинял интервал на ошибке
     учёта.
+
+    **Замер старше `ABANDON_AFTER_HOURS` тоже `None`.** §17.2 говорит, что
+    сеанс без ответа дольше этого срока становится `abandoned` и FSRS не
+    меняет; механизм живёт в WP-13, и до него такой сеанс остаётся
+    отвечаемым. Живой прогон WP-05 это и показал: задание, выданное сутками
+    раньше, дало `latency` в 87 157 486 мс, §13.2 прочитал его как «верно, но
+    дольше `SLOW_MS`» и поставил Hard — то есть расписание факта испортило
+    время простоя, а не ответ человека.
+
+    Решение Архитектора от 2026-10-13: отвечать на такое задание можно,
+    рейтинг ставится только по правильности, `latency_ms` в журнале остаётся
+    пустым. Порог взят тот же, что у §17.2, — другого числа для «сеанс
+    заброшен» в §30.3 нет, и выдумывать второе значило бы развести их при
+    первой же правке.
     """
     raw = (user_state or {}).get(SHOWN_AT)
     if not isinstance(raw, str):
@@ -626,4 +645,12 @@ def _latency_ms(user_state: dict[str, Any] | None, now: datetime.datetime) -> in
         # домыслить его значило бы вписать в журнал выдуманную длительность.
         log.info("shown_at_without_timezone", value=raw)
         return None
-    return max(int((now - shown_at).total_seconds() * 1000), 0)
+    elapsed = now - shown_at
+    if elapsed > datetime.timedelta(hours=abandon_after_hours):
+        log.info(
+            "shown_at_too_old",
+            hours=round(elapsed.total_seconds() / 3600, 1),
+            limit_hours=abandon_after_hours,
+        )
+        return None
+    return max(int(elapsed.total_seconds() * 1000), 0)
