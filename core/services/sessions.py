@@ -563,7 +563,17 @@ def _latency_ms(user_state: dict[str, Any] | None, now: datetime.datetime) -> in
         return None
     try:
         shown_at = datetime.datetime.fromisoformat(raw)
-    except (ValueError, TypeError):
+    except ValueError:
         log.info("shown_at_unparsable", value=raw)
+        return None
+    if shown_at.tzinfo is None:
+        # Отметка без часового пояса: вычитание из `now` с поясом даёт
+        # `TypeError`, то есть ответ не был бы принят из-за косметики. Ревью
+        # PR #34 показало, что прежний `except TypeError` стоял не там, где
+        # исключение возникает: не-строку отсекает `isinstance` выше, а
+        # падает **вычитание** после `try`. Проверка явная, а не перехват:
+        # у наивной отметки нет верной трактовки — часовой пояс неизвестен, и
+        # домыслить его значило бы вписать в журнал выдуманную длительность.
+        log.info("shown_at_without_timezone", value=raw)
         return None
     return max(int((now - shown_at).total_seconds() * 1000), 0)

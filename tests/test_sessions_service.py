@@ -12,7 +12,7 @@ import asyncio
 import datetime
 
 import pytest
-from sqlalchemy import func, insert, select
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from core.config import Settings
@@ -728,3 +728,66 @@ async def test_foreign_item_is_not_marked_shown(
             )
         ).scalar_one()
     assert shown_count == 1
+
+
+@pytest.mark.parametrize(
+    ("mark", "reason"),
+    [
+        ("чепуха", "строка не разбирается"),
+        ("2026-10-12T12:00:00", "отметка без часового пояса"),
+    ],
+)
+async def test_broken_shown_at_does_not_break_the_answer(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+    scheduler: FixedIntervalScheduler,
+    mark: str,
+    reason: str,
+) -> None:
+    """Испорченная отметка выдачи не отменяет приём ответа.
+
+    Два случая, и второй нашло ревью PR #34: прежний перехват `TypeError` стоял
+    там, где исключение не возникает, — не-строку отсекает проверка типа, —
+    а падало **вычитание** наивной отметки из момента с часовым поясом. Ответ
+    при этом уже проверен, и исключение означало бы «ответ не принят» из-за
+    косметики учёта времени.
+
+    `latency_ms` в журнале остаётся пустым, и это честнее нуля: ноль по §13.2
+    означает «ответил мгновенно» и давал бы Easy за ошибку учёта.
+    """
+    base, session_id = await _ready_session(engine, sessions, settings)
+
+    async with sessions() as session:
+        item = await current_item(session, session_id)
+        assert item is not None
+        await session.execute(
+            update(SessionItem)
+            .where(SessionItem.id == item.item_id)
+            .values(user_state={SHOWN_AT: mark})
+        )
+        await session.commit()
+
+    async with sessions() as session:
+        result = await answer_item(
+            session,
+            user_id=base.user_id,
+            item_id=item.item_id,
+            raw={"option": 0},
+            now=LATER,
+            settings=settings,
+            scheduler=scheduler,
+        )
+        await session.commit()
+
+    assert result is not None, f"{reason}: ответ не принят"
+    assert result.rating is Rating.GOOD
+
+    async with sessions() as session:
+        latency = (
+            await session.execute(
+                select(ReviewLog.latency_ms).where(ReviewLog.fact_id == item.fact_id)
+            )
+        ).scalar_one()
+    assert latency is None
