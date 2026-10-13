@@ -86,24 +86,30 @@ IDK_BUTTON = "🤷 Не знаю"
 def task_keyboard(item: ItemView) -> InlineKeyboardMarkup:
     """Клавиатура MCQ: номера одним рядом плюс «Не знаю». §20."""
     options = list(item.payload.get("options") or [])
-    numbers = [
-        InlineKeyboardButton(
-            text=str(number),
-            callback_data=Ans(si=item.item_id, v=index).pack(),
-        )
-        for index, number in enumerate(range(1, len(options) + 1))
-    ]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            numbers,
+    rows = []
+    if options:
+        # Пустой ряд Telegram отклоняет, и задание вообще не дошло бы. §9.2
+        # требует от mcq двух-четырёх вариантов, то есть строка без них
+        # испорчена (Issue #33); ответить на неё можно только «не знаю», и
+        # это честнее, чем отправка, падающая на стороне Telegram.
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text=IDK_BUTTON,
-                    callback_data=Ans(si=item.item_id, v=IDK).pack(),
+                    text=str(number),
+                    callback_data=Ans(si=item.item_id, v=number - 1).pack(),
                 )
-            ],
+                for number in range(1, len(options) + 1)
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=IDK_BUTTON,
+                callback_data=Ans(si=item.item_id, v=IDK).pack(),
+            )
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def render_task(item: ItemView) -> str:

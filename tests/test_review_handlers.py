@@ -23,6 +23,7 @@ from bot.callbacks import IDK, Ans
 from bot.handlers.review import (
     ALREADY_ANSWERED,
     BROKEN_QUESTION,
+    IDK_BUTTON,
     NOTHING_TO_REVIEW,
     handle_answer,
     handle_review,
@@ -804,3 +805,89 @@ async def test_deleted_previous_message_is_not_an_error(
                 _message(sent), session, settings, failing("Too Many Requests: retry after 5")
             )
         await session.rollback()
+
+
+async def test_explanation_and_summary_escape_model_text(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+) -> None:
+    """§19.2: экранируется всё от модели, не только текст задания.
+
+    В разбор попадают `detail`, эталон и цитата локатора, в итог — формулировки
+    фактов из списка ошибок. Незаэкранированная угловая скобка делает
+    сообщение невалидным HTML, и Telegram отказывается его отправлять: разбор
+    не дойдёт после уже принятого ответа.
+    """
+    base = await scaffold(engine, tg_id=OWNER_TG)
+    due_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+    payload = {"question": "Что это?", "options": ["<мел>", "утюг", "пар"]}
+    for index in range(3):
+        fact_id = await add_fact(
+            engine,
+            base,
+            statement=f"Факт <{index}> & другой",
+            detail="Линия <видна> на лицевой стороне & стирается",
+        )
+        await add_question(engine, fact_id, payload=payload, answer=MCQ_ANSWER)
+        await add_review_state(engine, base.user_id, fact_id, due_at=due_at)
+
+    sent = Sent()
+    async with sessions() as session:
+        await handle_review(_message(sent), session, settings, FakeBot())
+        await session.commit()
+
+    for _ in range(3):
+        async with sessions() as session:
+            item = await current_item(session, 1)
+            if item is None:
+                break
+            await handle_answer(
+                _callback(sent, Ans(si=item.item_id, v=IDK).pack()), session, settings, FakeBot()
+            )
+            await session.commit()
+
+    explanation = sent.edits[0]
+    assert "Линия &lt;видна&gt;" in explanation
+    assert "&amp; стирается" in explanation
+    assert "&lt;мел&gt;" in explanation, "эталон не заэкранирован"
+    assert "<b>Почему:</b>" in explanation, "разметка самого бота не должна экранироваться"
+
+    summary = sent.edits[-1]
+    assert "Факт &lt;0&gt; &amp; другой" in summary, "список ошибок не заэкранирован"
+
+
+async def test_question_without_options_still_gets_a_valid_keyboard(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+) -> None:
+    """Строка вопроса без вариантов не ломает отправку. §9.2, Issue #33.
+
+    Пустой ряд кнопок Telegram отклоняет, то есть задание вообще не дошло бы.
+    §9.2 требует от mcq двух-четырёх вариантов, значит такая строка испорчена;
+    остаётся «не знаю» — это честнее, чем отправка, падающая на стороне
+    Telegram.
+    """
+    base = await scaffold(engine, tg_id=OWNER_TG)
+    due_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+    for index in range(3):
+        fact_id = await add_fact(engine, base, statement=f"Факт {index}")
+        await add_question(
+            engine, fact_id, payload={"question": "Без вариантов"}, answer=MCQ_ANSWER
+        )
+        await add_review_state(engine, base.user_id, fact_id, due_at=due_at)
+
+    sent = Sent()
+    async with sessions() as session:
+        await handle_review(_message(sent), session, settings, FakeBot())
+        await session.commit()
+
+    keyboard = sent.keyboards[0]
+    assert keyboard is not None
+    rows = keyboard.inline_keyboard  # type: ignore[union-attr]
+    assert all(row for row in rows), "в клавиатуре есть пустой ряд — Telegram её отклонит"
+    assert len(rows) == 1
+    assert rows[0][0].text == IDK_BUTTON
