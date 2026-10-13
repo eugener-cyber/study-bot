@@ -125,3 +125,23 @@ def test_dockerfile_ships_migrations() -> None:
     body = DOCKERFILE.read_text(encoding="utf-8")
     assert "alembic.ini" in body
     assert "COPY alembic" in body
+
+
+def test_entrypoint_shell_supports_the_builtins_it_uses() -> None:
+    """Точка входа объявляет тот интерпретатор, расширения которого использует.
+
+    `wait -n` — расширение bash: в dash, который в Debian slim стоит
+    `/bin/sh`, оно даёт «wait: Illegal option -n», а со `set -e` скрипт на
+    этом падает. Контейнер уходит в цикл перезапуска, и механизм §1.4
+    «останавливаться, если упал любой из двух процессов» не работает совсем.
+
+    Дефект прожил от WP-03 до развёртывания WP-05 незамеченным: контейнер
+    работал на образе, собранном **раньше** правки скрипта, поэтому ни
+    `docker compose ps`, ни тесты его не видели. Отсюда и форма проверки — по
+    тексту скрипта, а не по запущенному контейнеру.
+    """
+    script = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+    first_line = script.splitlines()[0]
+
+    if "wait -n" in script:
+        assert first_line == "#!/bin/bash", f"`wait -n` требует bash, а объявлен {first_line!r}"
