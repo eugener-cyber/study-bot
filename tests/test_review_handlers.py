@@ -14,7 +14,7 @@ import pytest
 from aiogram.types import CallbackQuery, Chat, Message
 from aiogram.types import User as TgUser
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from bot.callbacks import IDK, Ans
@@ -560,3 +560,54 @@ async def test_garbage_callback_does_not_break_the_handler(
     assert sent.order.count("ack") == 1, f"{reason}: нажатие не подтверждено ровно один раз"
     assert BROKEN_QUESTION in sent.alerts
     assert "edit" not in sent.order, "разбор показан на неразобранном нажатии"
+
+
+async def test_texts_do_not_reveal_whether_a_foreign_item_exists(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+) -> None:
+    """Чужое существующее задание и несуществующее отвечаются одинаково.
+
+    Тело PR первой редакции утверждало, что три текста отказа дают один класс
+    случаев, — и это было неверно: проверка ответа срабатывала раньше проверки
+    владельца, поэтому на чужом **существующем** задании с испорченной строкой
+    вопроса бот отвечал «не получается проверить», а на несуществующем —
+    «уже отвечено». По паре ответов перебирались бы чужие идентификаторы.
+    """
+    base = await _due_facts(engine)
+    await scaffold(engine, tg_id=STRANGER_TG)
+    sent = Sent()
+
+    async with sessions() as session:
+        await handle_review(_message(sent), session, settings)
+        await session.commit()
+
+    async with sessions() as session:
+        item = await current_item(session, 1)
+        assert item is not None
+        # Строка вопроса портится: на ней проверка ответа дала бы свой текст.
+        await session.execute(
+            update(Question).where(Question.id == item.question_id).values(answer={"correct": 0})
+        )
+        await session.commit()
+
+    async with sessions() as session:
+        await handle_answer(
+            _callback(sent, Ans(si=item.item_id, v=0).pack(), tg_id=STRANGER_TG),
+            session,
+            settings,
+        )
+        await handle_answer(
+            _callback(sent, Ans(si=10**9, v=0).pack(), tg_id=STRANGER_TG),
+            session,
+            settings,
+        )
+        await session.commit()
+
+    assert len(sent.alerts) == 2, "один из отказов не дошёл до пользователя"
+    assert (
+        sent.alerts[0] == sent.alerts[1]
+    ), f"по текстам различимо существование чужого задания: {sent.alerts}"
+    assert base.user_id is not None

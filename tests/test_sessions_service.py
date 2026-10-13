@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from core.config import Settings
 from core.db.models import Question, ReviewLog, ReviewState, Session, SessionItem
+from core.learning.checking import InvalidAnswerError
 from core.learning.explain import Explanation
 from core.learning.rating import Rating
 from core.learning.scheduler import STUB_VERSION, FixedIntervalScheduler
@@ -791,3 +792,70 @@ async def test_broken_shown_at_does_not_break_the_answer(
             )
         ).scalar_one()
     assert latency is None
+
+
+async def test_foreign_item_is_refused_before_the_answer_is_parsed(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+    scheduler: FixedIntervalScheduler,
+) -> None:
+    """Владелец проверяется раньше разбора ответа. §18, §19.1.
+
+    Иначе снаружи различимо, существует ли чужое задание: на существующем
+    сработала бы проверка ответа и дала свой исход — `InvalidAnswerError` на
+    испорченной строке вопроса (Issue #33), — а на несуществующем вернулся бы
+    обычный отказ. Это оракул на перебор чужих идентификаторов, и текстами в
+    хендлере он не закрывается, только порядком.
+
+    Положительный ассерт первым: задание действительно существует и его
+    строка вопроса действительно испорчена, то есть проверка ответа **могла
+    бы** сработать.
+    """
+    base, session_id = await _ready_session(engine, sessions, settings)
+    stranger = await scaffold(engine, tg_id=911)
+
+    async with sessions() as session:
+        item = await current_item(session, session_id)
+        assert item is not None
+        await session.execute(
+            update(Question).where(Question.id == item.question_id).values(answer={"correct": 0})
+        )
+        await session.commit()
+
+    async with sessions() as session:
+        with pytest.raises(InvalidAnswerError):
+            await answer_item(
+                session,
+                user_id=base.user_id,
+                item_id=item.item_id,
+                raw={"option": 0},
+                now=LATER,
+                settings=settings,
+                scheduler=scheduler,
+            )
+
+    async with sessions() as session:
+        foreign = await answer_item(
+            session,
+            user_id=stranger.user_id,
+            item_id=item.item_id,
+            raw={"option": 0},
+            now=LATER,
+            settings=settings,
+            scheduler=scheduler,
+        )
+        missing = await answer_item(
+            session,
+            user_id=stranger.user_id,
+            item_id=10**9,
+            raw={"option": 0},
+            now=LATER,
+            settings=settings,
+            scheduler=scheduler,
+        )
+        await session.commit()
+
+    assert foreign is None, "чужое задание разобрано вместо отказа"
+    assert missing is None
