@@ -228,8 +228,16 @@ async def current_item(session: AsyncSession, session_id: int) -> ItemView | Non
     )
 
 
-async def mark_shown(session: AsyncSession, item_id: int, *, now: datetime.datetime) -> bool:
+async def mark_shown(
+    session: AsyncSession, item_id: int, *, user_id: int, now: datetime.datetime
+) -> bool:
     """Отмечает задание выданным. Возвращает, случилось ли это сейчас.
+
+    `user_id` обязателен и проверяется: отметка выдачи наращивает `shown_count`
+    и переставляет `last_q_type`, а §13.3 сортирует вопросы по первому и
+    смотрит на второй. Вызывать функцию на чужом задании сегодня неоткуда —
+    идентификатор приходит из собственной выборки, а не от клиента, — но
+    дешевле проверить здесь, чем полагаться на то, что так будет и дальше.
 
     §13.3: «После выдачи обновляются `last_q_type`, `last_direction`,
     `shown_count`, `last_shown_at`. Это счётчики презентации, а не learning
@@ -255,13 +263,14 @@ async def mark_shown(session: AsyncSession, item_id: int, *, now: datetime.datet
             )
             .join(Question, Question.id == SessionItem.question_id)
             .join(Session, Session.id == SessionItem.session_id)
-            .where(SessionItem.id == item_id)
+            .where(SessionItem.id == item_id, Session.user_id == user_id)
         )
     ).first()
     if row is None:
+        log.info("shown_not_marked_foreign_item", item_id=item_id, user_id=user_id)
         return False
 
-    question_id, fact_id, user_state, question_type, direction, user_id = row
+    question_id, fact_id, user_state, question_type, direction, _ = row
     state = dict(user_state or {})
     state[SHOWN_AT] = now.isoformat()
 
@@ -554,7 +563,7 @@ def _latency_ms(user_state: dict[str, Any] | None, now: datetime.datetime) -> in
         return None
     try:
         shown_at = datetime.datetime.fromisoformat(raw)
-    except ValueError:
+    except (ValueError, TypeError):
         log.info("shown_at_unparsable", value=raw)
         return None
     return max(int((now - shown_at).total_seconds() * 1000), 0)

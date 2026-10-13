@@ -206,7 +206,7 @@ async def test_rerunning_the_schedule_stage_keeps_accumulated_state(
         assert session_id is not None
         item = await current_item(session, session_id)
         assert item is not None
-        await mark_shown(session, item.item_id, now=NOW)
+        await mark_shown(session, item.item_id, user_id=user_id, now=NOW)
         answered = await answer_item(
             session,
             user_id=user_id,
@@ -253,7 +253,7 @@ async def test_unfinished_session_survives_a_fresh_connection(
         assert session_id is not None
         item = await current_item(session, session_id)
         assert item is not None
-        await mark_shown(session, item.item_id, now=NOW)
+        await mark_shown(session, item.item_id, user_id=user_id, now=NOW)
         await session.commit()
 
     await engine.dispose()
@@ -306,7 +306,7 @@ async def test_rerunning_the_questions_stage_on_answered_questions_loses_nothing
         assert session_id is not None
         item = await current_item(session, session_id)
         assert item is not None
-        await mark_shown(session, item.item_id, now=NOW)
+        await mark_shown(session, item.item_id, user_id=user_id, now=NOW)
         answered = await answer_item(
             session,
             user_id=user_id,

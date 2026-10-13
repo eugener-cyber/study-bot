@@ -102,7 +102,7 @@ async def test_showing_a_task_touches_counters_but_not_learning_state(
             )
         ).one()
 
-        assert await mark_shown(session, item.item_id, now=NOW) is True
+        assert await mark_shown(session, item.item_id, user_id=base.user_id, now=NOW) is True
         await session.commit()
 
     async with sessions() as session:
@@ -154,16 +154,16 @@ async def test_second_show_does_not_count_twice(
     §13.3 сортирует вопросы по `shown_count`, и если он считал бы перезагрузки
     экрана, порядок выдачи поехал бы от нажатий `/review`, а не от истории.
     """
-    _, session_id = await _ready_session(engine, sessions, settings)
+    base, session_id = await _ready_session(engine, sessions, settings)
 
     async with sessions() as session:
         item = await current_item(session, session_id)
         assert item is not None
-        assert await mark_shown(session, item.item_id, now=NOW) is True
+        assert await mark_shown(session, item.item_id, user_id=base.user_id, now=NOW) is True
         await session.commit()
 
     async with sessions() as session:
-        assert await mark_shown(session, item.item_id, now=LATER) is False
+        assert await mark_shown(session, item.item_id, user_id=base.user_id, now=LATER) is False
         await session.commit()
 
     async with sessions() as session:
@@ -193,7 +193,7 @@ async def test_correct_answer_writes_the_full_log_row(
     async with sessions() as session:
         item = await current_item(session, session_id)
         assert item is not None
-        await mark_shown(session, item.item_id, now=NOW)
+        await mark_shown(session, item.item_id, user_id=base.user_id, now=NOW)
         result = await answer_item(
             session,
             user_id=base.user_id,
@@ -259,7 +259,7 @@ async def test_first_answer_sets_seen_and_introduced_at_once(
     async with sessions() as session:
         item = await current_item(session, session_id)
         assert item is not None
-        await mark_shown(session, item.item_id, now=NOW)
+        await mark_shown(session, item.item_id, user_id=base.user_id, now=NOW)
         await answer_item(
             session,
             user_id=base.user_id,
@@ -330,7 +330,7 @@ async def test_stub_does_not_fill_fsrs_columns(
     async with sessions() as session:
         item = await current_item(session, session_id)
         assert item is not None
-        await mark_shown(session, item.item_id, now=NOW)
+        await mark_shown(session, item.item_id, user_id=base.user_id, now=NOW)
         await answer_item(
             session,
             user_id=base.user_id,
@@ -391,7 +391,7 @@ async def test_double_tap_writes_one_log_row(
     async with sessions() as session:
         item = await current_item(session, session_id)
         assert item is not None
-        await mark_shown(session, item.item_id, now=NOW)
+        await mark_shown(session, item.item_id, user_id=base.user_id, now=NOW)
         await session.commit()
 
     import core.services.sessions as service
@@ -542,7 +542,7 @@ async def test_answer_on_a_finished_session_changes_nothing(
     answered: list[int] = []
     async with sessions() as session:
         while (item := await current_item(session, session_id)) is not None:
-            await mark_shown(session, item.item_id, now=NOW)
+            await mark_shown(session, item.item_id, user_id=base.user_id, now=NOW)
             await answer_item(
                 session,
                 user_id=base.user_id,
@@ -594,13 +594,13 @@ async def test_someone_elses_item_is_not_answerable(
     отдельной проверкой перед записью она закрывала бы не гонку, а только
     невнимательность.
     """
-    _, session_id = await _ready_session(engine, sessions, settings)
+    base, session_id = await _ready_session(engine, sessions, settings)
     stranger = await scaffold(engine, tg_id=999)
 
     async with sessions() as session:
         item = await current_item(session, session_id)
         assert item is not None
-        await mark_shown(session, item.item_id, now=NOW)
+        await mark_shown(session, item.item_id, user_id=base.user_id, now=NOW)
         await session.commit()
 
     async with sessions() as session:
@@ -642,7 +642,7 @@ async def test_summary_counts_score_time_and_mistakes(
     async with sessions() as session:
         position = 0
         while (item := await current_item(session, session_id)) is not None:
-            await mark_shown(session, item.item_id, now=NOW)
+            await mark_shown(session, item.item_id, user_id=base.user_id, now=NOW)
             # Первое задание — верно, остальные — «не знаю».
             raw = {"option": 0} if position == 0 else {"idk": True}
             await answer_item(
@@ -677,12 +677,12 @@ async def test_shown_at_lands_in_user_state_not_in_fsm(
     Всё, что попало бы в FSM, терялось бы при `docker compose down`, а
     критерий приёмки WP-05 требует обратного.
     """
-    _, session_id = await _ready_session(engine, sessions, settings)
+    base, session_id = await _ready_session(engine, sessions, settings)
 
     async with sessions() as session:
         item = await current_item(session, session_id)
         assert item is not None
-        await mark_shown(session, item.item_id, now=NOW)
+        await mark_shown(session, item.item_id, user_id=base.user_id, now=NOW)
         await session.commit()
 
     async with sessions() as session:
@@ -693,3 +693,38 @@ async def test_shown_at_lands_in_user_state_not_in_fsm(
         ).scalar_one()
 
     assert SHOWN_AT in (user_state or {})
+
+
+async def test_foreign_item_is_not_marked_shown(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+) -> None:
+    """Отметка выдачи на чужом задании ничего не меняет.
+
+    Отметка наращивает `shown_count` и переставляет `last_q_type`, а §13.3
+    сортирует вопросы по первому и смотрит на второй: чужая выдача искажала бы
+    порядок заданий у владельца. Положительный ассерт первым — что для
+    владельца отметка как раз ставится.
+    """
+    base, session_id = await _ready_session(engine, sessions, settings)
+    stranger = await scaffold(engine, tg_id=909)
+
+    async with sessions() as session:
+        item = await current_item(session, session_id)
+        assert item is not None
+        assert await mark_shown(session, item.item_id, user_id=base.user_id, now=NOW) is True
+        await session.commit()
+
+    async with sessions() as session:
+        assert await mark_shown(session, item.item_id, user_id=stranger.user_id, now=LATER) is False
+        await session.commit()
+
+    async with sessions() as session:
+        shown_count = (
+            await session.execute(
+                select(Question.shown_count).where(Question.id == item.question_id)
+            )
+        ).scalar_one()
+    assert shown_count == 1

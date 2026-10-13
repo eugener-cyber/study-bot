@@ -187,7 +187,7 @@ async def show_session(tg_id: int | None = None) -> int:
                 print(f"Сеанс {session_id} уже доигран — заданий без ответа нет.")
                 return 1
 
-            await mark_shown(session, item.item_id, now=now)
+            await mark_shown(session, item.item_id, user_id=user_id, now=now)
             print(_render_item(session_id, item))
     finally:
         await engine.dispose()
@@ -249,7 +249,7 @@ async def answer(*, option: int | None = None, idk: bool = False, tg_id: int | N
             if not result.finished:
                 nxt = await current_item(session, session_id)
                 if nxt is not None:
-                    await mark_shown(session, nxt.item_id, now=now)
+                    await mark_shown(session, nxt.item_id, user_id=user_id, now=now)
                     print()
                     print(_render_item(session_id, nxt))
     finally:
