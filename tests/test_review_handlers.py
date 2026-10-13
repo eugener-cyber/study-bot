@@ -689,3 +689,109 @@ async def test_not_modified_is_ignored_but_other_failures_are_not(
         with pytest.raises(TelegramBadRequest, match="too long"):
             await handle_answer(other, session, settings)
         await session.commit()
+
+
+class FakeBot:
+    """Записывает правки клавиатур у сообщений, которых нет под рукой.
+
+    В хендлер `bot` приезжает инъекцией aiogram; здесь он подставляется
+    напрямую — проверяется поведение хендлера, а не диспетчера.
+    """
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.cleared: list[tuple[int, int]] = []
+        self.error = error
+
+    async def edit_message_reply_markup(
+        self, *, chat_id: int, message_id: int, reply_markup: object = None
+    ) -> None:
+        self.cleared.append((chat_id, message_id))
+        if self.error is not None:
+            raise self.error
+
+
+async def test_second_review_leaves_one_live_keyboard(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+) -> None:
+    """§20 и §3: живых клавиатур не больше одной.
+
+    Повторный `/review` при незавершённом сеансе присылает то же задание новым
+    сообщением — и обязан снять кнопки у прежнего. Нажатие на старое данных не
+    изменило бы (§38 №8, это держит сервис), но два сообщения с кнопками
+    выглядят сбоем, и непонятно, какое рабочее.
+
+    Положительный ассерт первым: оба задания действительно отправлены, то есть
+    прежнее сообщение существует и снимать клавиатуру есть с чего.
+    """
+    await _due_facts(engine)
+    sent = Sent()
+    bot = FakeBot()
+
+    async with sessions() as session:
+        await handle_review(_message(sent), session, settings, bot)
+        await session.commit()
+    async with sessions() as session:
+        control_after_first = (
+            await session.execute(select(Session.control_message_id))
+        ).scalar_one()
+
+    async with sessions() as session:
+        await handle_review(_message(sent), session, settings, bot)
+        await session.commit()
+
+    assert len(sent.texts) == 2, "второй /review не выдал задание"
+    assert bot.cleared == [
+        (OWNER_TG, control_after_first)
+    ], f"клавиатура прежнего задания не снята: {bot.cleared}"
+
+    async with sessions() as session:
+        control_after_second = (
+            await session.execute(select(Session.control_message_id))
+        ).scalar_one()
+    assert control_after_second != control_after_first, "колонка не обновилась"
+
+
+async def test_deleted_previous_message_is_not_an_error(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+) -> None:
+    """Прежнее сообщение удалено человеком — штатный исход, а не сбой.
+
+    Гасятся ровно два текста Telegram: «не изменено» и «сообщение не найдено».
+    Любая другая ошибка пробрасывается: снятие клавиатуры косметическое, но
+    молчать о `Too Many Requests` §37 нельзя — у этого сценария своё
+    поведение.
+    """
+    await _due_facts(engine)
+    sent = Sent()
+
+    def failing(text: str) -> FakeBot:
+        return FakeBot(
+            error=TelegramBadRequest(
+                method=AnswerCallbackQuery(callback_query_id="x"),
+                message=f"Telegram server says - {text}",
+            )
+        )
+
+    async with sessions() as session:
+        await handle_review(_message(sent), session, settings, FakeBot())
+        await session.commit()
+
+    async with sessions() as session:
+        await handle_review(
+            _message(sent), session, settings, failing("Bad Request: message to edit not found")
+        )
+        await session.commit()
+    assert len(sent.texts) == 2, "удалённое прежнее сообщение остановило выдачу"
+
+    async with sessions() as session:
+        with pytest.raises(TelegramBadRequest, match="Too Many Requests"):
+            await handle_review(
+                _message(sent), session, settings, failing("Too Many Requests: retry after 5")
+            )
+        await session.rollback()

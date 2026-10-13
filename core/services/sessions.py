@@ -203,6 +203,13 @@ async def session_of_item(session: AsyncSession, item_id: int, *, user_id: int) 
     return int(found) if found is not None else None
 
 
+async def control_message_id(session: AsyncSession, session_id: int) -> int | None:
+    """Сообщение с клавиатурой текущего задания, если оно известно. §20, §3."""
+    return (
+        await session.execute(select(Session.control_message_id).where(Session.id == session_id))
+    ).scalar_one_or_none()
+
+
 async def set_control_message(session: AsyncSession, session_id: int, message_id: int) -> None:
     """Запоминает сообщение с клавиатурой текущего задания. §20, §3.
 

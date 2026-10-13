@@ -22,7 +22,7 @@ from __future__ import annotations
 import html
 from datetime import UTC, datetime
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -42,6 +42,7 @@ from core.services.sessions import (
     SessionSummary,
     answer_item,
     assemble,
+    control_message_id,
     current_item,
     mark_shown,
     session_of_item,
@@ -68,6 +69,14 @@ BROKEN_QUESTION = "Это задание не получается провер�
 """`InvalidAnswerError`: испорченная строка вопроса (Issue #33) или подделанный
 `callback_data`. Ответ не засчитывается — §13.2 превратил бы «неверно» в
 рейтинг Again и испортил расписание факта по чужому запросу."""
+
+MESSAGE_GONE = "message to edit not found"
+"""Фрагмент ответа Telegram, когда правимое сообщение удалено.
+
+Снятие клавиатуры у прежнего задания — косметика: человек мог удалить
+сообщение сам, и это нормальный исход, а не сбой. Как и `NOT_MODIFIED`,
+различается по тексту — отдельного класса исключения в aiogram 3 нет.
+"""
 
 IDK_BUTTON = "🤷 Не знаю"
 """§20. Для MCQ показывается сразу — отложенные кнопки (CR-4,
@@ -171,7 +180,12 @@ async def _user_id(session: AsyncSession, tg_id: int) -> int | None:
     return int(user.id) if user is not None else None
 
 
-async def handle_review(message: Message, session: AsyncSession, settings: Settings) -> None:
+async def handle_review(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    bot: Bot | None = None,
+) -> None:
     """Команда `/review`: собрать или продолжить сеанс и выдать задание.
 
     При незавершённом сеансе выдаётся **текущее** задание, а не новое: §18
@@ -198,11 +212,16 @@ async def handle_review(message: Message, session: AsyncSession, settings: Setti
         return
 
     await mark_shown(session, item.item_id, user_id=user_id, now=now)
-    await _send_task(message, session, item)
+    await _send_task(message, session, item, bot)
     log.info("review_task_sent", user_id=user_id, session_id=session_id, item=item.item_id)
 
 
-async def handle_answer(callback: CallbackQuery, session: AsyncSession, settings: Settings) -> None:
+async def handle_answer(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    bot: Bot | None = None,
+) -> None:
     """Нажатие варианта или «Не знаю».
 
     Порядок строгий: подтверждение нажатия (§19.1) → мутация в сервисе →
@@ -267,21 +286,50 @@ async def handle_answer(callback: CallbackQuery, session: AsyncSession, settings
         return
 
     await mark_shown(session, item.item_id, user_id=user_id, now=now)
-    await _send_task(callback.message, session, item)
+    await _send_task(callback.message, session, item, bot)
 
 
-async def _send_task(message: Message, session: AsyncSession, item: ItemView) -> None:
-    """Отправляет задание и запоминает сообщение с клавиатурой (§20).
+async def _send_task(
+    message: Message, session: AsyncSession, item: ItemView, bot: Bot | None
+) -> None:
+    """Отправляет задание, снимая клавиатуру у прежнего сообщения. §20, §3.
 
-    `sessions.control_message_id` — колонка §3 именно под это: по завершении
-    задания клавиатуру нужно убрать, а убрать её можно только у известного
-    сообщения.
+    `sessions.control_message_id` существует ровно для этого: живых клавиатур
+    должно быть не больше одной. Иначе второй `/review` при незавершённом
+    сеансе оставляет два сообщения с кнопками, нажатие на старое данных не
+    меняет (§38 №8, это держит сервис) — но выглядит как сбой, и человек не
+    понимает, какое из сообщений рабочее.
+
+    Первая редакция колонку **писала и не читала**, а две докстроки утверждали
+    обратное — замечание 5 ревью PR #35. Запись без чтения не закрывает ничего.
+
+    Порядок: сначала новое сообщение, потом снятие клавиатуры у старого. При
+    обратном порядке неудачная отправка оставила бы человека вообще без
+    кнопок. Два исхода правки игнорируются как штатные — «не изменено» и
+    «сообщение не найдено», — остальные пробрасываются.
     """
+    previous = await control_message_id(session, item.session_id)
+
     sent = await message.answer(
         render_task(item), reply_markup=task_keyboard(item), parse_mode="HTML"
     )
     if isinstance(sent, Message):
         await set_control_message(session, item.session_id, sent.message_id)
+
+    if (
+        previous is None
+        or bot is None
+        or (isinstance(sent, Message) and previous == sent.message_id)
+    ):
+        return
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=message.chat.id, message_id=previous, reply_markup=None
+        )
+    except TelegramBadRequest as error:
+        if NOT_MODIFIED not in str(error) and MESSAGE_GONE not in str(error):
+            raise
+        log.info("previous_keyboard_not_cleared", message_id=previous)
 
 
 async def _show_explanation(callback: CallbackQuery, result: AnswerResult, *, item_id: int) -> None:
@@ -319,11 +367,11 @@ def build_review_router(settings: Settings) -> Router:
     """Роутер сеанса повторения. Фабрика — конвенция проекта с WP-01."""
     router = Router(name="review")
 
-    async def on_review(message: Message, session: AsyncSession) -> None:
-        await handle_review(message, session, settings)
+    async def on_review(message: Message, session: AsyncSession, bot: Bot) -> None:
+        await handle_review(message, session, settings, bot)
 
-    async def on_answer(callback: CallbackQuery, session: AsyncSession) -> None:
-        await handle_answer(callback, session, settings)
+    async def on_answer(callback: CallbackQuery, session: AsyncSession, bot: Bot) -> None:
+        await handle_answer(callback, session, settings, bot)
 
     router.message.register(on_review, Command("review"))
     router.callback_query.register(on_answer, F.data.startswith(f"{Ans.__prefix__}:"))
