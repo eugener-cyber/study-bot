@@ -12,11 +12,12 @@ import asyncio
 import datetime
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from core.config import Settings
 from core.db.models import Question, ReviewLog, ReviewState, Session, SessionItem
+from core.learning.explain import Explanation
 from core.learning.rating import Rating
 from core.learning.scheduler import STUB_VERSION, FixedIntervalScheduler
 from core.services.sessions import (
@@ -367,13 +368,23 @@ async def test_double_tap_writes_one_log_row(
     clean_tables: None,
     settings: Settings,
     scheduler: FixedIntervalScheduler,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """§18, двойной тап: право на мутацию получает ровно один.
 
-    Две **одновременные** транзакции, а не последовательные вызовы: при
-    `READ COMMITTED` обе читают `answered_at IS NULL`, и проверка перед
-    записью такую гонку не закрывает. Первым стоит положительный ассерт, что
-    столкновение случилось: ровно один из двух получил право.
+    Транзакции обязаны **перекрываться**, а не идти одна за другой. Первая
+    редакция этого теста разводила тапы задержкой 0.05 с при длительности
+    транзакции около 0.014 с — то есть второй начинался после коммита
+    первого, и ревью PR #34 показало, что тест остаётся зелёным, если
+    условный `UPDATE` заменить чтением перед записью. Перекрытие по задержке
+    невоспроизводимо в принципе: оно зависит от скорости базы.
+
+    Поэтому перекрытие задаётся событием. Первый тап удерживается **после**
+    захвата строки — в точке, куда `answer_item` приходит, уже выполнив
+    условный `UPDATE`: сборка разбора подменена на ожидание. Второй тап в это
+    время упирается в блокировку строки на уровне Postgres, и то, что он
+    действительно заблокирован, проверяется положительным ассертом до любых
+    выводов о результате.
     """
     base, session_id = await _ready_session(engine, sessions, settings)
 
@@ -383,20 +394,26 @@ async def test_double_tap_writes_one_log_row(
         await mark_shown(session, item.item_id, now=NOW)
         await session.commit()
 
-    async def tap(option: int, *, delay: float) -> AnswerResult | None:
-        """Один тап в своей транзакции.
+    import core.services.sessions as service
 
-        Каждый тап коммитит **свою** транзакцию сам. Первая редакция этого
-        теста держала обе открытыми одновременно и коммитила первую после
-        вызова второй — и вставала навсегда: второй `UPDATE` ждал на уровне
-        строки Postgres коммита, до которого тест не доходил. Это и есть
-        доказательство, что право на мутацию выдаёт база, а не код.
+    claimed = asyncio.Event()
+    release = asyncio.Event()
+    real_build = service.build_explanation
 
-        Задержка у второго тапа делает порядок воспроизводимым: без неё то,
-        какая из двух корутин дойдёт до `UPDATE` первой, решает планировщик
-        asyncio, и тест проверял бы одно и то же через раз.
+    async def holding_build(*args: object, **kwargs: object) -> Explanation:
+        """Удерживает транзакцию победителя до разрешения теста.
+
+        Подменяется именно сборка разбора: это первая точка `answer_item`
+        после условного `UPDATE`, то есть строка уже заблокирована, а журнал
+        и состояние повторения уже записаны в той же транзакции.
         """
-        await asyncio.sleep(delay)
+        claimed.set()
+        await release.wait()
+        return await real_build(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "build_explanation", holding_build)
+
+    async def tap(option: int) -> AnswerResult | None:
         async with sessions() as session:
             result = await answer_item(
                 session,
@@ -410,10 +427,24 @@ async def test_double_tap_writes_one_log_row(
             await session.commit()
             return result
 
-    first_result, second_result = await asyncio.gather(tap(0, delay=0.0), tap(1, delay=0.05))
+    winner = asyncio.create_task(tap(0))
+    await asyncio.wait_for(claimed.wait(), timeout=10)
+
+    loser = asyncio.create_task(tap(1))
+    await asyncio.sleep(0.3)
+
+    # Положительный ассерт первым: столкновение действительно произошло.
+    # Второй тап висит на блокировке строки, а не вернулся мгновенно.
+    assert not loser.done(), "второй тап не заблокирован — транзакции не перекрылись"
+    assert not winner.done(), "первый тап уже завершился — удержание не сработало"
+
+    release.set()
+    first_result, second_result = await asyncio.wait_for(asyncio.gather(winner, loser), timeout=10)
 
     accepted = [result for result in (first_result, second_result) if result is not None]
     assert len(accepted) == 1, "право на мутацию получили оба — §18 нарушен"
+    assert first_result is not None, "право получил не тот, кто захватил строку первым"
+    assert second_result is None
 
     async with sessions() as session:
         logs = (await session.execute(select(func.count()).select_from(ReviewLog))).scalar_one()
@@ -424,9 +455,78 @@ async def test_double_tap_writes_one_log_row(
                 )
             )
         ).scalar_one()
+        rating = (
+            await session.execute(select(SessionItem.rating).where(SessionItem.id == item.item_id))
+        ).scalar_one()
 
     assert logs == 1
     assert reps == 1
+    assert rating == int(Rating.GOOD), "рейтинг переписан проигравшим тапом"
+
+
+async def test_two_simultaneous_assemblies_give_one_session(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+) -> None:
+    """§18, двойная сессия: «второй процесс молча прекращает создание».
+
+    Проверяется ветка `SAVEPOINT` в `create_session`: конкурент уже вставил
+    строку активной сессии и держит транзакцию. Вставка `assemble` упирается в
+    частичный уникальный индекс `uq_sessions_user_active` (§3.1), ждёт на
+    уровне Postgres, после коммита конкурента получает `IntegrityError` —
+    и должна вернуть **существующую** сессию, а не упасть и не отравить
+    внешнюю транзакцию.
+
+    Положительный ассерт первым: `assemble` действительно заблокирован на
+    индексе. Без него тест был бы зелёным и в случае, когда конкурент не
+    успел вставить строку.
+    """
+    base = await scaffold(engine)
+    due_at = NOW - datetime.timedelta(minutes=1)
+    for index in range(3):
+        fact_id = await add_fact(engine, base, statement=f"Факт {index}")
+        await add_question(engine, fact_id)
+        await add_review_state(engine, base.user_id, fact_id, due_at=due_at)
+
+    rival = sessions()
+    await rival.__aenter__()
+    rival_session_id = int(
+        (
+            await rival.execute(
+                insert(Session)
+                .values(user_id=base.user_id, kind="scheduled", status="active", started_at=NOW)
+                .returning(Session.id)
+            )
+        ).scalar_one()
+    )
+
+    async def assemble_under_race() -> int | None:
+        async with sessions() as session:
+            created = await assemble(session, user_id=base.user_id, settings=settings, now=NOW)
+            await session.commit()
+            return created
+
+    task = asyncio.create_task(assemble_under_race())
+    await asyncio.sleep(0.3)
+    assert not task.done(), "вставка не заблокирована — конкурент не держит индекс"
+
+    await rival.commit()
+    await rival.__aexit__(None, None, None)
+
+    assembled = await asyncio.wait_for(task, timeout=10)
+    assert assembled == rival_session_id, "создана вторая сессия вместо существующей"
+
+    async with sessions() as session:
+        active = (
+            await session.execute(
+                select(func.count())
+                .select_from(Session)
+                .where(Session.user_id == base.user_id, Session.status == "active")
+            )
+        ).scalar_one()
+    assert active == 1
 
 
 async def test_answer_on_a_finished_session_changes_nothing(
