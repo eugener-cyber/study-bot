@@ -23,12 +23,14 @@ import html
 from datetime import UTC, datetime
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.callbacks import IDK, Ans
+from bot.progress import NOT_MODIFIED
 from core.config import Settings
 from core.learning.checking import InvalidAnswerError
 from core.learning.explain import Explanation
@@ -252,7 +254,7 @@ async def handle_answer(callback: CallbackQuery, session: AsyncSession, settings
         await callback.answer(ALREADY_ANSWERED, show_alert=True)
         return
 
-    await _show_explanation(callback, result)
+    await _show_explanation(callback, result, item_id=parsed.si)
 
     if result.finished or not isinstance(callback.message, Message):
         return
@@ -282,13 +284,22 @@ async def _send_task(message: Message, session: AsyncSession, item: ItemView) ->
         await set_control_message(session, item.session_id, sent.message_id)
 
 
-async def _show_explanation(callback: CallbackQuery, result: AnswerResult) -> None:
+async def _show_explanation(callback: CallbackQuery, result: AnswerResult, *, item_id: int) -> None:
     """Правит сообщение задания разбором и снимает клавиатуру.
 
     Клавиатура снимается, а не оставляется: §38 №8 требует, чтобы старый
     callback не менял данные, и сервис это обеспечивает, — но кнопка, которая
-    ничего не делает, выглядит сбоем. Сбой правки гасится: ответ уже записан,
-    и падение здесь означало бы «ответ не принят» при принятом ответе.
+    ничего не делает, выглядит сбоем.
+
+    **Гасится ровно одно исключение** — «message is not modified» (§19.1):
+    оно неизбежно при быстрых повторных нажатиях и означает, что текст уже
+    такой. Остальные пробрасываются. Первая редакция ловила `Exception`, и
+    вместе с этим случаем молча гасились `RetryAfter` и «сообщение длиннее
+    4096» — оба §37, то есть сценарии отказа со своим поведением, — и ошибки
+    разбора HTML, то есть дефект §19.2 стал бы невидимым (п. 4 списка
+    костылей). Константа переиспользуется из `bot/progress.py`: отдельного
+    класса исключения в aiogram 3 нет, различение по тексту, и двух копий
+    этого текста быть не должно.
     """
     text = render_explanation(result.explanation)
     if result.summary is not None:
@@ -298,8 +309,10 @@ async def _show_explanation(callback: CallbackQuery, result: AnswerResult) -> No
         return
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=None)
-    except Exception:
-        log.info("explanation_not_edited", item_id=result.explanation.statement[:40])
+    except TelegramBadRequest as error:
+        if NOT_MODIFIED not in str(error):
+            raise
+        log.info("explanation_not_modified", item_id=item_id)
 
 
 def build_review_router(settings: Settings) -> Router:

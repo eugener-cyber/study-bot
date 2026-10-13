@@ -11,6 +11,8 @@ from __future__ import annotations
 import datetime
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import AnswerCallbackQuery
 from aiogram.types import CallbackQuery, Chat, Message
 from aiogram.types import User as TgUser
 from pydantic import ValidationError
@@ -611,3 +613,79 @@ async def test_texts_do_not_reveal_whether_a_foreign_item_exists(
         sent.alerts[0] == sent.alerts[1]
     ), f"по текстам различимо существование чужого задания: {sent.alerts}"
     assert base.user_id is not None
+
+
+async def test_not_modified_is_ignored_but_other_failures_are_not(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+) -> None:
+    """§19.1: гасится ровно «message is not modified», остальное пробрасывается.
+
+    Текст ошибки берётся **дословно тот**, что отдаёт Telegram, а не
+    собирается из константы кода: фейк, построенный из той же константы, по
+    которой ветвится обработчик, самосогласован при любом её значении — урок
+    WP-03 про `NOT_MODIFIED`.
+
+    Вторая половина обязательна: `RetryAfter` и «сообщение длиннее 4096» —
+    сценарии отказа §37 со своим поведением, и молча гасить их нельзя.
+    """
+    await _due_facts(engine)
+    sent = Sent()
+
+    async with sessions() as session:
+        await handle_review(_message(sent), session, settings)
+        await session.commit()
+    async with sessions() as session:
+        item = await current_item(session, 1)
+        assert item is not None
+
+    async def failing_edit(message: Message, error: Exception) -> None:
+        async def edit_text(text: str, **kwargs: object) -> Message:
+            raise error
+
+        object.__setattr__(message, "edit_text", edit_text)
+
+    # «message is not modified» — гасится, ответ принят.
+    callback = _callback(sent, Ans(si=item.item_id, v=0).pack())
+    assert isinstance(callback.message, Message)
+    await failing_edit(
+        callback.message,
+        TelegramBadRequest(
+            method=AnswerCallbackQuery(callback_query_id="x"),
+            message=(
+                "Telegram server says - Bad Request: message is not modified: specified "
+                "new message content and reply markup are exactly the same"
+            ),
+        ),
+    )
+    async with sessions() as session:
+        await handle_answer(callback, session, settings)
+        await session.commit()
+
+    async with sessions() as session:
+        answered_at = (
+            await session.execute(
+                select(SessionItem.answered_at).where(SessionItem.id == item.item_id)
+            )
+        ).scalar_one()
+    assert answered_at is not None, "ответ не принят, хотя правка сообщения не обязательна"
+
+    # Любая другая ошибка Telegram — наружу, к наблюдателю `errors`.
+    async with sessions() as session:
+        nxt = await current_item(session, 1)
+        assert nxt is not None
+    other = _callback(sent, Ans(si=nxt.item_id, v=0).pack())
+    assert isinstance(other.message, Message)
+    await failing_edit(
+        other.message,
+        TelegramBadRequest(
+            method=AnswerCallbackQuery(callback_query_id="x"),
+            message="Telegram server says - Bad Request: message is too long",
+        ),
+    )
+    async with sessions() as session:
+        with pytest.raises(TelegramBadRequest, match="too long"):
+            await handle_answer(other, session, settings)
+        await session.commit()
