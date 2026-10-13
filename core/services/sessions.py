@@ -186,6 +186,44 @@ async def create_session(
     return session_id
 
 
+async def session_of_item(session: AsyncSession, item_id: int, *, user_id: int) -> int | None:
+    """Сессия задания, если она принадлежит этому человеку, иначе `None`.
+
+    `user_id` стоит в условии, а не проверяется после выборки: идентификатор
+    задания приходит из `callback_data`, то есть от клиента (§19.1), и чужая
+    сессия не должна быть видна даже номером.
+    """
+    found = (
+        await session.execute(
+            select(SessionItem.session_id)
+            .join(Session, Session.id == SessionItem.session_id)
+            .where(SessionItem.id == item_id, Session.user_id == user_id)
+        )
+    ).scalar_one_or_none()
+    return int(found) if found is not None else None
+
+
+async def control_message_id(session: AsyncSession, session_id: int) -> int | None:
+    """Сообщение с клавиатурой текущего задания, если оно известно. §20, §3."""
+    return (
+        await session.execute(select(Session.control_message_id).where(Session.id == session_id))
+    ).scalar_one_or_none()
+
+
+async def set_control_message(session: AsyncSession, session_id: int, message_id: int) -> None:
+    """Запоминает сообщение с клавиатурой текущего задания. §20, §3.
+
+    `sessions.control_message_id` — колонка §3 именно под это: по завершении
+    задания клавиатуру нужно убрать или заменить разбором, а сделать это можно
+    только у известного сообщения. Для медиагрупп §20 требует отдельного
+    хранения идентификаторов в `session_items.user_state` — это WP-14 вместе с
+    `match_image`.
+    """
+    await session.execute(
+        update(Session).where(Session.id == session_id).values(control_message_id=message_id)
+    )
+
+
 async def current_item(session: AsyncSession, session_id: int) -> ItemView | None:
     """Первое неотвеченное задание сессии или `None`, если все отвечены."""
     total = (
@@ -319,10 +357,15 @@ async def answer_item(
     """Принимает ответ. `None` — ответ не принят, и данные не изменились.
 
     `None` означает один из случаев §18: сессия уже не активна, на задание
-    уже ответили (двойной тап), либо задание принадлежит другому человеку.
-    Все три различимы только в журнале — наружу они выглядят одинаково, и это
-    правильно: по разным ответам бота на эти случаи можно было бы перебирать
-    чужие идентификаторы.
+    уже ответили (двойной тап), задания не существует, либо оно принадлежит
+    другому человеку. Все четыре различимы только в журнале — наружу они
+    выглядят одинаково, и это правильно: по разным ответам бота на эти случаи
+    можно было бы перебирать чужие идентификаторы.
+
+    Поэтому и порядок внутри: владелец проверяется **до** разбора ответа.
+    Проверка ответа на чужом задании давала бы свой исход (`InvalidAnswerError`
+    на испорченной строке вопроса, Issue #33), то есть отличала бы чужое
+    существующее задание от несуществующего.
     """
     row = (
         await session.execute(
@@ -336,17 +379,24 @@ async def answer_item(
                 Question.answer,
             )
             .join(Question, Question.id == SessionItem.question_id)
-            .where(SessionItem.id == item_id)
+            .join(Session, Session.id == SessionItem.session_id)
+            # Владелец проверяется **здесь**, до разбора ответа. Иначе чужое
+            # существующее задание и несуществующее различимы снаружи: на
+            # первом сначала срабатывала бы проверка ответа и давала свой
+            # текст (испорченная строка вопроса, Issue #33), на втором —
+            # отказ. Это оракул на существование чужих идентификаторов, и
+            # закрыть его текстами в хендлере нельзя — только порядком.
+            .where(SessionItem.id == item_id, Session.user_id == user_id)
         )
     ).first()
     if row is None:
-        log.info("answer_rejected_unknown_item", item_id=item_id)
+        log.info("answer_rejected_unknown_or_foreign_item", item_id=item_id, user_id=user_id)
         return None
 
     session_id, question_id, fact_id, user_state, question_type, payload, answer = row
     check = check_answer(str(question_type), payload or {}, answer or {}, raw)
 
-    latency_ms = _latency_ms(user_state, now)
+    latency_ms = _latency_ms(user_state, now, abandon_after_hours=settings.ABANDON_AFTER_HOURS)
     state_row = (
         await session.execute(
             select(
@@ -551,12 +601,31 @@ async def _finish_if_complete(
     return True
 
 
-def _latency_ms(user_state: dict[str, Any] | None, now: datetime.datetime) -> int | None:
-    """Время от выдачи до ответа. `None`, если отметки выдачи нет.
+def _latency_ms(
+    user_state: dict[str, Any] | None,
+    now: datetime.datetime,
+    *,
+    abandon_after_hours: int,
+) -> int | None:
+    """Время от выдачи до ответа. `None`, если его нельзя считать осмысленным.
 
     `None`, а не ноль: ноль означает «ответил мгновенно» и по §13.2 давал бы
     Easy за пропавшую отметку времени — то есть удлинял интервал на ошибке
     учёта.
+
+    **Замер старше `ABANDON_AFTER_HOURS` тоже `None`.** §17.2 говорит, что
+    сеанс без ответа дольше этого срока становится `abandoned` и FSRS не
+    меняет; механизм живёт в WP-13, и до него такой сеанс остаётся
+    отвечаемым. Живой прогон WP-05 это и показал: задание, выданное сутками
+    раньше, дало `latency` в 87 157 486 мс, §13.2 прочитал его как «верно, но
+    дольше `SLOW_MS`» и поставил Hard — то есть расписание факта испортило
+    время простоя, а не ответ человека.
+
+    Решение Архитектора от 2026-10-13: отвечать на такое задание можно,
+    рейтинг ставится только по правильности, `latency_ms` в журнале остаётся
+    пустым. Порог взят тот же, что у §17.2, — другого числа для «сеанс
+    заброшен» в §30.3 нет, и выдумывать второе значило бы развести их при
+    первой же правке.
     """
     raw = (user_state or {}).get(SHOWN_AT)
     if not isinstance(raw, str):
@@ -576,4 +645,12 @@ def _latency_ms(user_state: dict[str, Any] | None, now: datetime.datetime) -> in
         # домыслить его значило бы вписать в журнал выдуманную длительность.
         log.info("shown_at_without_timezone", value=raw)
         return None
-    return max(int((now - shown_at).total_seconds() * 1000), 0)
+    elapsed = now - shown_at
+    if elapsed > datetime.timedelta(hours=abandon_after_hours):
+        log.info(
+            "shown_at_too_old",
+            hours=round(elapsed.total_seconds() / 3600, 1),
+            limit_hours=abandon_after_hours,
+        )
+        return None
+    return max(int(elapsed.total_seconds() * 1000), 0)

@@ -16,7 +16,12 @@ from pathlib import Path
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from core.learning.explain import build_explanation, correct_answer_text, locator_hint
+from core.learning.explain import (
+    build_explanation,
+    correct_answer_text,
+    format_duration,
+    locator_hint,
+)
 from tests.learning_factory import MCQ_PAYLOAD, add_fact, add_fragment, add_question, scaffold
 
 pytestmark = pytest.mark.db
@@ -155,3 +160,30 @@ async def test_explanation_survives_a_fact_without_fragments(
 
     assert explanation.locator_hints == ()
     assert explanation.verdict == "wrong"
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (0, "0 с"),
+        (45, "45 с"),
+        (60, "1 мин 0 с"),
+        (95, "1 мин 35 с"),
+        (3599, "59 мин 59 с"),
+        (3600, "1 ч 0 мин"),
+        (7325, "2 ч 2 мин"),
+        (86399, "23 ч 59 мин"),
+        (86400, "1 д 0 ч"),
+        (87205, "1 д 0 ч"),
+        (259200, "3 д 0 ч"),
+    ],
+)
+def test_duration_reads_like_a_human_wrote_it(seconds: int, expected: str) -> None:
+    """§22.1: «время» в итоге сеанса.
+
+    Границы проверяются по обе стороны каждого перехода. Поводом стал живой
+    прогон WP-05: итог показал «1453 мин 25 с» на сеансе, начавшемся сутками
+    раньше, — число верное и нечитаемое. Почему сеанс жил сутки — вопрос
+    §17.2 и WP-13, но формат обязан держать любую длительность.
+    """
+    assert format_duration(seconds) == expected

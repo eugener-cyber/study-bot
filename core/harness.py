@@ -39,6 +39,7 @@ from core.db.session import session_scope
 from core.ingest import handlers as h
 from core.ingest.pipeline import StageHandler, process_material
 from core.learning.checking import InvalidAnswerError
+from core.learning.explain import format_duration
 from core.learning.rating import Rating
 from core.learning.scheduler import FixedIntervalScheduler
 from core.logging import configure_logging, get_logger
@@ -327,7 +328,7 @@ def _render_summary(summary: SessionSummary) -> str:
     lines = [
         "— Сеанс завершён —",
         f"Счёт: {summary.correct} из {summary.total}",
-        f"Время: {summary.seconds} с",
+        f"Время: {format_duration(summary.seconds)}",
     ]
     if summary.mistakes:
         lines.append("Ошибки:")
