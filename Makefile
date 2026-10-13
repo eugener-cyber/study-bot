@@ -1,11 +1,11 @@
 # Команды харнесса (План реализации §1.4). Всего там восемь целей; существуют
-# check (WP-01), migrate/downgrade/reset (WP-02) и seed (WP-03). Остальным
-# нечем работать: session и answer относятся к WP-05, dump-material к WP-06,
+# check (WP-01), migrate/downgrade/reset (WP-02), seed (WP-03), session и
+# answer (WP-05). Остальным нечем работать: dump-material относится к WP-06,
 # evals к WP-07, cite к WP-11.
 
 PY := .venv/bin/python
 
-.PHONY: check lint type test install migrate downgrade reset seed
+.PHONY: check lint type test install migrate downgrade reset seed session answer
 
 install:
 	python3 -m venv .venv
@@ -46,3 +46,15 @@ reset:
 seed:
 	@test -n "$(FILE)" || (echo "укажите FILE=путь/к/файлу"; exit 1)
 	$(PY) -m core.harness seed "$(FILE)"
+
+# Сеанс повторения §16: собрать (или продолжить) и показать задание.
+#   make session            — владелец берётся первым из ALLOWED_USER_IDS
+#   make session TG_ID=123  — конкретный пользователь
+session:
+	$(PY) -m core.harness session $(if $(TG_ID),--tg-id $(TG_ID),)
+
+# Ответ на текущее задание §21.1 и разбор §22.
+#   make answer OPTION=1    — номер варианта, считая с единицы
+#   make answer IDK=1       — «не знаю» (§20): отдельный исход, а не вариант
+answer:
+	$(PY) -m core.harness answer $(if $(OPTION),--option $(OPTION),) $(if $(IDK),--idk,) $(if $(TG_ID),--tg-id $(TG_ID),)
