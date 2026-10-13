@@ -114,6 +114,10 @@ async def test_suspended_state_is_not_a_candidate(
     async with sessions() as session:
         session_id = await assemble(session, user_id=base.user_id, settings=settings, now=NOW)
         await session.commit()
+        # Положительный ассерт до отрицательного: сессия действительно
+        # собралась. Без него «лишнего факта в сессии нет» выполняется и у
+        # планировщика, который не выдаёт ничего вовсе.
+        assert session_id is not None, "сессия не собралась — проверять нечего"
         facts = (
             (
                 await session.execute(
@@ -124,7 +128,9 @@ async def test_suspended_state_is_not_a_candidate(
             .all()
         )
 
-    assert extra not in {int(item) for item in facts}
+    selected = {int(item) for item in facts}
+    assert len(selected) == MIN_SESSION_ITEMS, "сессия собрана не из ожидаемых заданий"
+    assert extra not in selected
 
 
 async def test_derived_fact_is_not_a_candidate(
@@ -148,6 +154,10 @@ async def test_derived_fact_is_not_a_candidate(
     async with sessions() as session:
         session_id = await assemble(session, user_id=base.user_id, settings=settings, now=NOW)
         await session.commit()
+        # Положительный ассерт до отрицательного: сессия действительно
+        # собралась. Без него «лишнего факта в сессии нет» выполняется и у
+        # планировщика, который не выдаёт ничего вовсе.
+        assert session_id is not None, "сессия не собралась — проверять нечего"
         facts = (
             (
                 await session.execute(
@@ -158,7 +168,9 @@ async def test_derived_fact_is_not_a_candidate(
             .all()
         )
 
-    assert derived not in {int(item) for item in facts}
+    selected = {int(item) for item in facts}
+    assert len(selected) == MIN_SESSION_ITEMS, "сессия собрана не из ожидаемых заданий"
+    assert derived not in selected
 
 
 async def test_fact_with_only_an_open_question_is_skipped(
@@ -183,6 +195,10 @@ async def test_fact_with_only_an_open_question_is_skipped(
     async with sessions() as session:
         session_id = await assemble(session, user_id=base.user_id, settings=settings, now=NOW)
         await session.commit()
+        # Положительный ассерт до отрицательного: сессия действительно
+        # собралась. Без него «лишнего факта в сессии нет» выполняется и у
+        # планировщика, который не выдаёт ничего вовсе.
+        assert session_id is not None, "сессия не собралась — проверять нечего"
         facts = (
             (
                 await session.execute(
@@ -193,7 +209,9 @@ async def test_fact_with_only_an_open_question_is_skipped(
             .all()
         )
 
-    assert open_only not in {int(item) for item in facts}
+    selected = {int(item) for item in facts}
+    assert len(selected) == MIN_SESSION_ITEMS, "сессия собрана не из ожидаемых заданий"
+    assert open_only not in selected
 
 
 async def test_open_only_facts_do_not_count_towards_the_minimum(
@@ -235,6 +253,10 @@ async def test_future_due_facts_are_not_candidates(
     async with sessions() as session:
         session_id = await assemble(session, user_id=base.user_id, settings=settings, now=NOW)
         await session.commit()
+        # Положительный ассерт до отрицательного: сессия действительно
+        # собралась. Без него «лишнего факта в сессии нет» выполняется и у
+        # планировщика, который не выдаёт ничего вовсе.
+        assert session_id is not None, "сессия не собралась — проверять нечего"
         facts = (
             (
                 await session.execute(
@@ -245,7 +267,9 @@ async def test_future_due_facts_are_not_candidates(
             .all()
         )
 
-    assert later not in {int(item) for item in facts}
+    selected = {int(item) for item in facts}
+    assert len(selected) == MIN_SESSION_ITEMS, "сессия собрана не из ожидаемых заданий"
+    assert later not in selected
 
 
 async def test_facts_with_more_lapses_come_first(
