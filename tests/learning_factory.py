@@ -105,6 +105,44 @@ async def scaffold(engine: AsyncEngine, *, tg_id: int = 111) -> Scaffold:
     )
 
 
+async def add_fragment(
+    engine: AsyncEngine,
+    base: Scaffold,
+    *,
+    position: int,
+    quote: str,
+    kind: str = "text",
+) -> int:
+    """Ещё один фрагмент того же материала.
+
+    Нужен там, где проверяется §23: «факт регулярно опирается на два-три
+    фрагмента, и подсветка только первого показывает половину обоснования».
+    Один фрагмент на факт — удобное упрощение, на котором это требование
+    проверить нельзя.
+    """
+    async with engine.begin() as connection:
+        return int(
+            (
+                await connection.execute(
+                    insert(Fragment)
+                    .values(
+                        material_id=base.material_id,
+                        ord=position,
+                        kind=kind,
+                        locator={
+                            "type": "web",
+                            "url": "file:///materials/raskroy.md",
+                            "quote": quote,
+                        },
+                        text=quote,
+                        quality=1.0,
+                    )
+                    .returning(Fragment.id)
+                )
+            ).scalar_one()
+        )
+
+
 async def add_fact(
     engine: AsyncEngine,
     base: Scaffold,
@@ -115,6 +153,7 @@ async def add_fact(
     importance: int = 2,
     derived: bool = False,
     suspended: bool = False,
+    fragment_ids: list[int] | None = None,
 ) -> int:
     async with engine.begin() as connection:
         return int(
@@ -127,7 +166,9 @@ async def add_fact(
                         statement=statement,
                         detail=detail,
                         kind="definition",
-                        fragment_ids=[base.fragment_id],
+                        fragment_ids=(
+                            fragment_ids if fragment_ids is not None else [base.fragment_id]
+                        ),
                         importance=importance,
                         difficulty=2,
                         confidence=confidence,
