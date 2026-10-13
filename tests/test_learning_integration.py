@@ -38,7 +38,19 @@ from tests.test_pipeline import _adapter, _completed, _material, _run
 
 pytestmark = pytest.mark.db
 
-NOW = datetime.datetime(2026, 10, 12, 12, 0, tzinfo=datetime.UTC)
+NOW = datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1)
+"""Опорный момент — **относительно настоящих часов**, а не календарная дата.
+
+Фиксированная дата здесь была дефектом: стадия `schedule` ставит
+`due_at = processed_at + NEW_FACT_DELAY` по `datetime.now` (§4.6,
+`core/ingest/handlers.py`), и при `NOW` в прошлом ни один факт не наступал —
+тесты были зелёными только в день, когда их написали, и красными на
+следующий. Час вперёд берётся с запасом к `NEW_FACT_DELAY_MIN = 10`.
+
+Остальные тесты пакета фиксированный момент сохраняют и правильно: там срок
+задаёт фабрика, а не настоящие часы.
+"""
+
 LATER = NOW + datetime.timedelta(seconds=10)
 
 
