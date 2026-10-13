@@ -29,7 +29,7 @@ import datetime
 from dataclasses import dataclass
 from typing import Final
 
-from sqlalchemy import exists, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import Settings
@@ -40,6 +40,18 @@ from core.learning.selection import select_question
 from core.logging import get_logger
 
 log = get_logger(__name__)
+
+DEFAULT_SESSION_SIZE: Final = 6
+"""Размер сессии, когда у пользователя колонка пуста. §3, `users.session_size`.
+
+Повторяет **умолчание схемы**, а не вводит новое число: `server_default` этой
+колонки равен 6 (`0001_schema.py`). Пустой она бывает только у строк, созданных
+в обход схемы, — и тогда правильнее взять то же значение, что взяла бы база,
+чем придумать своё. В §30.3 этого числа нет и быть не должно: это поле
+пользователя, а не порог конфигурации.
+
+Расхождение с миграцией поймает `test_default_session_size_matches_the_schema`.
+"""
 
 PLANNER_VERSION: Final = "skeleton-1"
 """Значение `review_logs.planner_version` (§3, §13.1).
@@ -74,11 +86,13 @@ async def plan_items(
     факты ждут следующего тика».
     """
     session_size = (
-        await session.execute(select(User.session_size).where(User.id == user_id))
+        await session.execute(
+            select(func.coalesce(User.session_size, DEFAULT_SESSION_SIZE)).where(User.id == user_id)
+        )
     ).scalar_one_or_none()
     if session_size is None:
-        session_size = 6
-        log.info("session_size_missing_default_used", user_id=user_id, size=session_size)
+        log.info("planner_without_user", user_id=user_id)
+        return []
 
     teachable = teachable_facts_select(settings.MIN_FACT_CONFIDENCE).subquery()
     answerable = (
@@ -101,7 +115,21 @@ async def plan_items(
             .join(teachable, teachable.c.fact_id == ReviewState.fact_id)
             .where(
                 ReviewState.user_id == user_id,
-                ReviewState.suspended.is_not(True),
+                # Дословно `NOT suspended`, как в §16. Форма условия решает,
+                # применим ли частичный индекс `ix_review_states_user_due`:
+                # его предикат — `WHERE NOT suspended` (§3.1), и доказать
+                # импликацию Postgres умеет только для `NOT suspended` и
+                # `suspended = false`. Замер на 200 тысячах строк с
+                # `enable_seqscan = off`:
+                #
+                #   NOT suspended       -> Index Scan, due_at в Index Cond
+                #   suspended = false   -> Index Scan, due_at в Index Cond
+                #   suspended IS FALSE  -> Seq Scan, индекс не применён
+                #
+                # То есть `IS FALSE` теряет индекс так же, как `IS NOT TRUE`,
+                # и §16 стоит выполнять буквально. Семантика при `NULL` та же:
+                # `NOT NULL` даёт `NULL`, строка отбрасывается.
+                ~ReviewState.suspended,
                 ReviewState.due_at <= now,
                 # Фильтр по отвечаемому типу стоит в запросе по двум причинам.
                 # Первая — та же, что у предиката §16: иначе непригодные факты
