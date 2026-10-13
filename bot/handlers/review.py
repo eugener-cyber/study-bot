@@ -224,10 +224,18 @@ async def handle_answer(
 ) -> None:
     """Нажатие варианта или «Не знаю».
 
-    Порядок строгий: подтверждение нажатия (§19.1) → мутация в сервисе →
-    правка сообщения с разбором → следующее задание. Подтверждение первым
-    потому, что правка может не удаться, а неподтверждённое нажатие Telegram
-    показывает часиками на кнопке.
+    Порядок строгий: мутация в сервисе → подтверждение нажатия (§19.1) →
+    правка сообщения с разбором → следующее задание. Подтверждение стоит
+    **до правки**, потому что правка может не удаться, а неподтверждённое
+    нажатие Telegram показывает часиками на кнопке.
+
+    **Подтверждение ровно одно на нажатие.** Первая редакция подтверждала
+    дважды — пустым вызовом сразу после разбора `callback_data` и затем
+    алертом в ветках отказа, — а Telegram принимает `answerCallbackQuery`
+    один раз на `callback_query_id`: второй отбрасывается, то есть тексты
+    §18 и §38 №8 до человека не доходили бы вовсе. Замечание 6 ревью PR #35.
+    Фейк в тестах этого не показывал, потому что всегда отвечал успехом;
+    теперь тесты считают подтверждения.
     """
     if callback.data is None or callback.from_user is None:  # pragma: no cover
         return
@@ -243,8 +251,6 @@ async def handle_answer(
         log.info("callback_not_parsed", data=callback.data, reason=type(error).__name__)
         await callback.answer(BROKEN_QUESTION, show_alert=True)
         return
-
-    await callback.answer()
 
     user_id = await _user_id(session, callback.from_user.id)
     if user_id is None:
@@ -273,6 +279,8 @@ async def handle_answer(
         await callback.answer(ALREADY_ANSWERED, show_alert=True)
         return
 
+    # Единственное подтверждение успешного пути — и оно до правки сообщения.
+    await callback.answer()
     await _show_explanation(callback, result, item_id=parsed.si)
 
     if result.finished or not isinstance(callback.message, Message):

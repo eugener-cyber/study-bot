@@ -230,7 +230,7 @@ async def test_pressing_an_option_acknowledges_before_editing(
         await handle_answer(_callback(sent, Ans(si=item.item_id, v=0).pack()), session, settings)
         await session.commit()
 
-    assert "ack" in sent.order
+    assert sent.order.count("ack") == 1, "нажатие подтверждено не один раз"
     assert "edit" in sent.order
     assert sent.order.index("ack") < sent.order.index("edit")
     assert "✅ Верно" in sent.edits[0]
@@ -325,6 +325,10 @@ async def test_second_tap_changes_nothing_and_says_so(
     assert logs_after == 1
     assert rating == 3, "рейтинг изменён вторым нажатием"
     assert ALREADY_ANSWERED in sent.alerts
+    # По одному подтверждению на каждое из двух нажатий: Telegram принимает
+    # answerCallbackQuery один раз на callback_query_id, и второй вызов
+    # отбросил бы именно этот алерт.
+    assert sent.order.count("ack") == 2
 
 
 async def test_someone_elses_item_is_refused(
@@ -362,6 +366,10 @@ async def test_someone_elses_item_is_refused(
     assert answered_at is None
     assert logs == 0
     assert ALREADY_ANSWERED in sent.alerts
+    # Одно нажатие — одно подтверждение, и это он, с алертом: Telegram
+    # принимает answerCallbackQuery один раз на callback_query_id, и пустое
+    # подтверждение перед алертом отбросило бы сам алерт.
+    assert sent.order.count("ack") == 1
 
 
 async def test_broken_question_is_refused_without_scoring(
@@ -403,6 +411,7 @@ async def test_broken_question_is_refused_without_scoring(
     assert answered_at is None, "испорченное задание засчитано"
     assert logs == 0
     assert BROKEN_QUESTION in sent.alerts
+    assert sent.order.count("ack") == 1
 
 
 async def test_summary_comes_with_the_last_explanation(
