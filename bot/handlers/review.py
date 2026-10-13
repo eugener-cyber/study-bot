@@ -190,7 +190,7 @@ async def handle_review(
     message: Message,
     session: AsyncSession,
     settings: Settings,
-    bot: Bot | None = None,
+    bot: Bot,
 ) -> None:
     """Команда `/review`: собрать или продолжить сеанс и выдать задание.
 
@@ -226,7 +226,7 @@ async def handle_answer(
     callback: CallbackQuery,
     session: AsyncSession,
     settings: Settings,
-    bot: Bot | None = None,
+    bot: Bot,
 ) -> None:
     """Нажатие варианта или «Не знаю».
 
@@ -300,11 +300,22 @@ async def handle_answer(
         return
 
     await mark_shown(session, item.item_id, user_id=user_id, now=now)
-    await _send_task(callback.message, session, item, bot)
+    await _send_task(
+        callback.message,
+        session,
+        item,
+        bot,
+        already_cleared=callback.message.message_id,
+    )
 
 
 async def _send_task(
-    message: Message, session: AsyncSession, item: ItemView, bot: Bot | None
+    message: Message,
+    session: AsyncSession,
+    item: ItemView,
+    bot: Bot,
+    *,
+    already_cleared: int | None = None,
 ) -> None:
     """Отправляет задание, снимая клавиатуру у прежнего сообщения. §20, §3.
 
@@ -321,6 +332,12 @@ async def _send_task(
     обратном порядке неудачная отправка оставила бы человека вообще без
     кнопок. Два исхода правки игнорируются как штатные — «не изменено» и
     «сообщение не найдено», — остальные пробрасываются.
+
+    `already_cleared` — сообщение, с которого клавиатуру уже сняли в этом же
+    обработчике. На пути ответа это то самое сообщение, которое стало
+    разбором: без оговорки сюда шёл второй вызов API на каждый ответ, Telegram
+    отвечал «message is not modified», и в журнал писалась строка о неснятой
+    клавиатуре — на совершенно нормальном пути.
     """
     previous = await control_message_id(session, item.session_id)
 
@@ -332,8 +349,11 @@ async def _send_task(
 
     if (
         previous is None
-        or bot is None
         or (isinstance(sent, Message) and previous == sent.message_id)
+        # Клавиатуру этого сообщения уже снял разбор: второй вызов API получил
+        # бы «message is not modified» и писал бы в журнал строку о неснятой
+        # клавиатуре на совершенно нормальном пути.
+        or previous == already_cleared
     ):
         return
     try:

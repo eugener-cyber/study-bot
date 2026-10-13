@@ -67,14 +67,15 @@ class Sent:
     def __init__(self) -> None:
         self.order: list[str] = []
         self.texts: list[str] = []
+        self.ids: list[int] = []
         self.keyboards: list[object] = []
         self.edits: list[str] = []
         self.alerts: list[str] = []
 
 
-def _message(sent: Sent, tg_id: int = OWNER_TG) -> Message:
+def _message(sent: Sent, tg_id: int = OWNER_TG, *, message_id: int = 10) -> Message:
     message = Message(
-        message_id=10,
+        message_id=message_id,
         date=datetime.datetime(2026, 10, 13),
         chat=Chat(id=tg_id, type="private"),
         from_user=TgUser(id=tg_id, is_bot=False, first_name="T"),
@@ -85,8 +86,10 @@ def _message(sent: Sent, tg_id: int = OWNER_TG) -> Message:
         sent.order.append("send")
         sent.texts.append(text)
         sent.keyboards.append(kwargs.get("reply_markup"))
+        message_id = 11 + len(sent.texts)
+        sent.ids.append(message_id)
         return Message(
-            message_id=11 + len(sent.texts),
+            message_id=message_id,
             date=datetime.datetime(2026, 10, 13),
             chat=Chat(id=tg_id, type="private"),
         )
@@ -96,7 +99,15 @@ def _message(sent: Sent, tg_id: int = OWNER_TG) -> Message:
 
 
 def _callback(sent: Sent, data: str, tg_id: int = OWNER_TG) -> CallbackQuery:
-    inner = _message(sent, tg_id)
+    """Нажатие на **последнем отправленном** сообщении бота.
+
+    Идентификатор берётся из журнала отправок, а не выдумывается: в чате
+    нажатие приходит именно на то сообщение, которое несёт клавиатуру, то есть
+    на `sessions.control_message_id`. Фейк с произвольным идентификатором
+    давал бы ветку, недостижимую в работе, — и ровно это скрыло бы лишний
+    вызов API при снятии клавиатуры (оговорка B фазы 2 ревью PR #35).
+    """
+    inner = _message(sent, tg_id, message_id=sent.ids[-1] if sent.ids else 10)
 
     async def edit_text(text: str, **kwargs: object) -> Message:
         sent.order.append("edit")
@@ -148,7 +159,7 @@ async def test_review_without_candidates_answers_instead_of_silence(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
 
     assert sent.texts == [NOTHING_TO_REVIEW]
@@ -165,7 +176,7 @@ async def test_review_sends_task_with_numbered_options_and_keyboard(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
 
     assert len(sent.texts) == 1
@@ -196,7 +207,7 @@ async def test_control_message_id_is_remembered(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
 
     async with sessions() as session:
@@ -220,7 +231,7 @@ async def test_pressing_an_option_acknowledges_before_editing(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
 
     async with sessions() as session:
@@ -228,7 +239,9 @@ async def test_pressing_an_option_acknowledges_before_editing(
         assert item is not None
 
     async with sessions() as session:
-        await handle_answer(_callback(sent, Ans(si=item.item_id, v=0).pack()), session, settings)
+        await handle_answer(
+            _callback(sent, Ans(si=item.item_id, v=0).pack()), session, settings, FakeBot()
+        )
         await session.commit()
 
     assert sent.order.count("ack") == 1, "нажатие подтверждено не один раз"
@@ -249,12 +262,14 @@ async def test_next_task_arrives_after_the_explanation(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
     async with sessions() as session:
         item = await current_item(session, 1)
         assert item is not None
-        await handle_answer(_callback(sent, Ans(si=item.item_id, v=0).pack()), session, settings)
+        await handle_answer(
+            _callback(sent, Ans(si=item.item_id, v=0).pack()), session, settings, FakeBot()
+        )
         await session.commit()
 
     assert "Задание 2 из 3" in sent.texts[-1]
@@ -272,12 +287,14 @@ async def test_dont_know_is_recorded_as_skipped(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
     async with sessions() as session:
         item = await current_item(session, 1)
         assert item is not None
-        await handle_answer(_callback(sent, Ans(si=item.item_id, v=IDK).pack()), session, settings)
+        await handle_answer(
+            _callback(sent, Ans(si=item.item_id, v=IDK).pack()), session, settings, FakeBot()
+        )
         await session.commit()
 
     async with sessions() as session:
@@ -299,12 +316,14 @@ async def test_second_tap_changes_nothing_and_says_so(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
     async with sessions() as session:
         item = await current_item(session, 1)
         assert item is not None
-        await handle_answer(_callback(sent, Ans(si=item.item_id, v=0).pack()), session, settings)
+        await handle_answer(
+            _callback(sent, Ans(si=item.item_id, v=0).pack()), session, settings, FakeBot()
+        )
         await session.commit()
 
     async with sessions() as session:
@@ -312,7 +331,9 @@ async def test_second_tap_changes_nothing_and_says_so(
     assert logs == 1, "первый тап не прошёл — проверять нечего"
 
     async with sessions() as session:
-        await handle_answer(_callback(sent, Ans(si=item.item_id, v=1).pack()), session, settings)
+        await handle_answer(
+            _callback(sent, Ans(si=item.item_id, v=1).pack()), session, settings, FakeBot()
+        )
         await session.commit()
 
     async with sessions() as session:
@@ -344,7 +365,7 @@ async def test_someone_elses_item_is_refused(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
     async with sessions() as session:
         item = await current_item(session, 1)
@@ -353,6 +374,7 @@ async def test_someone_elses_item_is_refused(
             _callback(sent, Ans(si=item.item_id, v=0).pack(), tg_id=STRANGER_TG),
             session,
             settings,
+            FakeBot(),
         )
         await session.commit()
 
@@ -393,12 +415,14 @@ async def test_broken_question_is_refused_without_scoring(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
     async with sessions() as session:
         item = await current_item(session, 1)
         assert item is not None
-        await handle_answer(_callback(sent, Ans(si=item.item_id, v=0).pack()), session, settings)
+        await handle_answer(
+            _callback(sent, Ans(si=item.item_id, v=0).pack()), session, settings, FakeBot()
+        )
         await session.commit()
 
     async with sessions() as session:
@@ -426,7 +450,7 @@ async def test_summary_comes_with_the_last_explanation(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
 
     for _ in range(3):
@@ -435,7 +459,10 @@ async def test_summary_comes_with_the_last_explanation(
             if item is None:
                 break
             await handle_answer(
-                _callback(sent, Ans(si=item.item_id, v=0).pack()), session, settings
+                _callback(sent, Ans(si=item.item_id, v=0).pack()),
+                session,
+                settings,
+                FakeBot(),
             )
             await session.commit()
 
@@ -479,7 +506,7 @@ async def test_question_text_from_the_model_is_escaped(
 
     sent = Sent()
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
 
     text = sent.texts[0]
@@ -503,10 +530,10 @@ async def test_questions_shown_count_grows_once_per_delivery(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
 
     async with sessions() as session:
@@ -562,11 +589,11 @@ async def test_garbage_callback_does_not_break_the_handler(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
 
     async with sessions() as session:
-        await handle_answer(_callback(sent, data), session, settings)
+        await handle_answer(_callback(sent, data), session, settings, FakeBot())
         await session.commit()
 
     assert sent.order.count("ack") == 1, f"{reason}: нажатие не подтверждено ровно один раз"
@@ -593,7 +620,7 @@ async def test_texts_do_not_reveal_whether_a_foreign_item_exists(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
 
     async with sessions() as session:
@@ -610,11 +637,13 @@ async def test_texts_do_not_reveal_whether_a_foreign_item_exists(
             _callback(sent, Ans(si=item.item_id, v=0).pack(), tg_id=STRANGER_TG),
             session,
             settings,
+            FakeBot(),
         )
         await handle_answer(
             _callback(sent, Ans(si=10**9, v=0).pack(), tg_id=STRANGER_TG),
             session,
             settings,
+            FakeBot(),
         )
         await session.commit()
 
@@ -645,7 +674,7 @@ async def test_not_modified_is_ignored_but_other_failures_are_not(
     sent = Sent()
 
     async with sessions() as session:
-        await handle_review(_message(sent), session, settings)
+        await handle_review(_message(sent), session, settings, FakeBot())
         await session.commit()
     async with sessions() as session:
         item = await current_item(session, 1)
@@ -671,7 +700,7 @@ async def test_not_modified_is_ignored_but_other_failures_are_not(
         ),
     )
     async with sessions() as session:
-        await handle_answer(callback, session, settings)
+        await handle_answer(callback, session, settings, FakeBot())
         await session.commit()
 
     async with sessions() as session:
@@ -697,7 +726,7 @@ async def test_not_modified_is_ignored_but_other_failures_are_not(
     )
     async with sessions() as session:
         with pytest.raises(TelegramBadRequest, match="too long"):
-            await handle_answer(other, session, settings)
+            await handle_answer(other, session, settings, FakeBot())
         await session.commit()
 
 
@@ -891,3 +920,38 @@ async def test_question_without_options_still_gets_a_valid_keyboard(
     assert all(row for row in rows), "в клавиатуре есть пустой ряд — Telegram её отклонит"
     assert len(rows) == 1
     assert rows[0][0].text == IDK_BUTTON
+
+
+async def test_answer_does_not_clear_the_keyboard_twice(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+) -> None:
+    """На пути ответа клавиатура снимается один раз, а не дважды.
+
+    Разбор правит то же сообщение и уже убирает кнопки; второй вызов API по
+    тому же сообщению получал бы «message is not modified» и писал в журнал
+    строку о неснятой клавиатуре — на совершенно нормальном пути. Оговорка B
+    фазы 2 ревью PR #35.
+
+    Положительный ассерт первым: ответ принят и следующее задание выдано, то
+    есть выдача действительно проходила через место, где снимается клавиатура.
+    """
+    await _due_facts(engine)
+    sent = Sent()
+    bot = FakeBot()
+
+    async with sessions() as session:
+        await handle_review(_message(sent), session, settings, bot)
+        await session.commit()
+    async with sessions() as session:
+        item = await current_item(session, 1)
+        assert item is not None
+        await handle_answer(
+            _callback(sent, Ans(si=item.item_id, v=0).pack()), session, settings, bot
+        )
+        await session.commit()
+
+    assert "Задание 2 из 3" in sent.texts[-1], "следующее задание не выдано"
+    assert bot.cleared == [], f"клавиатура снята повторно: {bot.cleared}"
