@@ -186,6 +186,20 @@ async def create_session(
     return session_id
 
 
+async def set_control_message(session: AsyncSession, session_id: int, message_id: int) -> None:
+    """Запоминает сообщение с клавиатурой текущего задания. §20, §3.
+
+    `sessions.control_message_id` — колонка §3 именно под это: по завершении
+    задания клавиатуру нужно убрать или заменить разбором, а сделать это можно
+    только у известного сообщения. Для медиагрупп §20 требует отдельного
+    хранения идентификаторов в `session_items.user_state` — это WP-14 вместе с
+    `match_image`.
+    """
+    await session.execute(
+        update(Session).where(Session.id == session_id).values(control_message_id=message_id)
+    )
+
+
 async def current_item(session: AsyncSession, session_id: int) -> ItemView | None:
     """Первое неотвеченное задание сессии или `None`, если все отвечены."""
     total = (
