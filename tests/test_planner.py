@@ -9,21 +9,20 @@
 from __future__ import annotations
 
 import datetime
-from pathlib import Path
 
 import pytest
 from sqlalchemy import select, update
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from core.config import Settings
 from core.db.models import SessionItem, User
+from core.learning.planner import candidates_statement
 from core.services.sessions import assemble
 from tests.conftest import ENV_STUB
 from tests.learning_factory import NOW, Scaffold, add_fact, add_question, add_review_state, scaffold
 
 pytestmark = pytest.mark.db
-
-ROOT = Path(__file__).resolve().parent.parent
 
 MIN_SESSION_ITEMS = 3
 """§30.3: `MIN_SESSION_ITEMS` = 3. Литерал намеренно — урок про `TRUNCATE_AT`."""
@@ -382,36 +381,45 @@ def test_default_session_size_matches_the_schema() -> None:
     assert str(column.server_default.arg) == str(DEFAULT_SESSION_SIZE)
 
 
-def test_candidates_query_keeps_the_partial_index_applicable() -> None:
-    """Условие приостановки записано формой, которая не теряет индекс §3.1.
+def test_candidates_query_keeps_the_partial_index_applicable(settings: Settings) -> None:
+    """Запрос кандидатов §16 записан формой, не теряющей частичный индекс §3.1.
 
-    Частичный индекс `ix_review_states_user_due` объявлен с предикатом
-    `WHERE NOT suspended`, и применим он только к условиям, из которых
-    Postgres умеет вывести этот предикат. Замер на 200 тысячах строк с
-    `enable_seqscan = off` (воспроизводится вручную, в тесте не повторяется —
-    на малых таблицах планировщик выбирает перебор при любой формулировке, и
-    такой тест был бы зелёным на сломанном коде):
+    Проверяется **скомпилированный SQL** запроса планировщика, а не текст
+    модуля: так проверка не ломается от слова `suspended` в докстроке и
+    переживает переименования.
+
+    Почему не план запроса. Разделение по плану существует и воспроизводимо —
+    на пустой таблице при `enable_seqscan = off` упрощённый запрос
+    `user_id = … AND NOT suspended AND due_at <= now()` даёт `Index Scan using
+    ix_review_states_user_due`, а он же с `IS FALSE` — `Bitmap Index Scan on
+    review_states_pkey`. Но на **полном** запросе кандидатов, с подзапросом
+    обучаемости и `EXISTS` по вопросам, Postgres заходит от `questions` и
+    добирается до `review_states` вложенным циклом по `facts_pkey`: частичный
+    индекс не используется ни при одной из формулировок, и тест на плане был
+    бы зелёным на сломанном коде. Проверено прогоном, а не рассуждением.
+
+    Замер, из которого взята норма (200 тысяч строк, `enable_seqscan = off`):
 
     ```
-    NOT suspended       -> Index Scan using ix_review_states_user_due,
-                           Index Cond: user_id = 1 AND due_at <= now()
+    NOT suspended       -> Index Scan using ix_…_user_due, due_at в Index Cond
     suspended = false   -> то же
     suspended IS FALSE  -> Seq Scan, индекс не применён
+    suspended IS NOT TRUE -> Seq Scan, индекс не применён
     ```
 
-    Поэтому проверка идёт по исходному тексту — тот же приём, что у
-    `test_create_all_is_not_used` и `test_threshold_not_inlined_by_consumers`:
-    договорённость, которую не проверяет прогон, живёт до первого спешного
-    коммита. Замечание 1 ревью PR #34 нашло здесь `is_not(True)`; `is_(False)`,
+    Postgres выводит предикат `WHERE NOT suspended` только из первых двух
+    форм. Замечание 1 ревью PR #34 нашло здесь `is_not(True)`; `is_(False)`,
     которое выглядит исправлением, теряет индекс точно так же.
     """
-    source = (ROOT / "core" / "learning" / "planner.py").read_text(encoding="utf-8")
-    condition_lines = [
-        line.strip()
-        for line in source.splitlines()
-        if "suspended" in line and not line.strip().startswith("#")
-    ]
+    compiled = str(
+        candidates_statement(
+            user_id=1,
+            min_confidence=settings.MIN_FACT_CONFIDENCE,
+            now=NOW,
+            session_size=6,
+        ).compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+    )
 
-    assert condition_lines == ["~ReviewState.suspended,"], condition_lines
-    assert "suspended.is_(False)" not in source
-    assert "suspended.is_not(True)" not in source
+    assert "NOT review_states.suspended" in compiled, compiled
+    assert "review_states.suspended IS false" not in compiled
+    assert "review_states.suspended IS NOT true" not in compiled

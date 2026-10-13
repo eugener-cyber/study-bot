@@ -29,7 +29,7 @@ import datetime
 from dataclasses import dataclass
 from typing import Final
 
-from sqlalchemy import exists, func, select
+from sqlalchemy import Select, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import Settings
@@ -72,6 +72,59 @@ class PlannedItem:
     direction: str | None
 
 
+def candidates_statement(
+    *,
+    user_id: int,
+    min_confidence: float,
+    now: datetime.datetime,
+    session_size: int,
+) -> Select[int, str | None, str | None]:
+    """Запрос кандидатов §16. Отдельной функцией — чтобы его можно было
+    проверить планом, а не только прогоном.
+
+    Три условия и фильтр отвечаемых типов, всё внутри SQL: §16 запрещает
+    отбирать после выборки, а `MIN_SESSION_ITEMS` обязан считаться по
+    заданиям, которые человек реально получит.
+
+    Форма условия приостановки существенна: `NOT suspended` оставляет
+    применимым частичный индекс `ix_review_states_user_due` (§3.1), а
+    `IS FALSE` и `IS NOT TRUE` — нет, см. `test_candidates_query_can_use_the_partial_index`.
+    """
+    teachable = teachable_facts_select(min_confidence).subquery()
+    answerable = (
+        exists()
+        .where(
+            Question.fact_id == ReviewState.fact_id,
+            Question.status == "valid",
+            Question.type.in_(sorted(ANSWERABLE_TYPES)),
+        )
+        .correlate(ReviewState)
+    )
+
+    return (
+        select(
+            ReviewState.fact_id,
+            ReviewState.last_q_type,
+            ReviewState.last_direction,
+        )
+        .join(teachable, teachable.c.fact_id == ReviewState.fact_id)
+        .where(
+            ReviewState.user_id == user_id,
+            # Дословно `NOT suspended`, как в §16: форма решает, применим ли
+            # частичный индекс §3.1. Замер на 200 тысячах строк показал, что
+            # Postgres выводит предикат `WHERE NOT suspended` только из
+            # `NOT suspended` и `suspended = false`; `IS FALSE` теряет индекс
+            # так же, как `IS NOT TRUE`. Семантика при `NULL` та же: строка
+            # отбрасывается.
+            ~ReviewState.suspended,
+            ReviewState.due_at <= now,
+            answerable,
+        )
+        .order_by(ReviewState.lapses.desc().nullslast(), ReviewState.due_at.asc())
+        .limit(session_size)
+    )
+
+
 async def plan_items(
     session: AsyncSession,
     *,
@@ -94,52 +147,14 @@ async def plan_items(
         log.info("planner_without_user", user_id=user_id)
         return []
 
-    teachable = teachable_facts_select(settings.MIN_FACT_CONFIDENCE).subquery()
-    answerable = (
-        exists()
-        .where(
-            Question.fact_id == ReviewState.fact_id,
-            Question.status == "valid",
-            Question.type.in_(sorted(ANSWERABLE_TYPES)),
-        )
-        .correlate(ReviewState)
-    )
-
     candidates = (
         await session.execute(
-            select(
-                ReviewState.fact_id,
-                ReviewState.last_q_type,
-                ReviewState.last_direction,
+            candidates_statement(
+                user_id=user_id,
+                min_confidence=settings.MIN_FACT_CONFIDENCE,
+                now=now,
+                session_size=int(session_size),
             )
-            .join(teachable, teachable.c.fact_id == ReviewState.fact_id)
-            .where(
-                ReviewState.user_id == user_id,
-                # Дословно `NOT suspended`, как в §16. Форма условия решает,
-                # применим ли частичный индекс `ix_review_states_user_due`:
-                # его предикат — `WHERE NOT suspended` (§3.1), и доказать
-                # импликацию Postgres умеет только для `NOT suspended` и
-                # `suspended = false`. Замер на 200 тысячах строк с
-                # `enable_seqscan = off`:
-                #
-                #   NOT suspended       -> Index Scan, due_at в Index Cond
-                #   suspended = false   -> Index Scan, due_at в Index Cond
-                #   suspended IS FALSE  -> Seq Scan, индекс не применён
-                #
-                # То есть `IS FALSE` теряет индекс так же, как `IS NOT TRUE`,
-                # и §16 стоит выполнять буквально. Семантика при `NULL` та же:
-                # `NOT NULL` даёт `NULL`, строка отбрасывается.
-                ~ReviewState.suspended,
-                ReviewState.due_at <= now,
-                # Фильтр по отвечаемому типу стоит в запросе по двум причинам.
-                # Первая — та же, что у предиката §16: иначе непригодные факты
-                # перебираются на каждом тике. Вторая — `MIN_SESSION_ITEMS`
-                # обязан считаться по заданиям, которые человек реально
-                # получит, иначе сессия молча выходит короче порога.
-                answerable,
-            )
-            .order_by(ReviewState.lapses.desc().nullslast(), ReviewState.due_at.asc())
-            .limit(session_size)
         )
     ).all()
 
