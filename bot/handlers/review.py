@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.callbacks import IDK, Ans
@@ -210,7 +211,18 @@ async def handle_answer(callback: CallbackQuery, session: AsyncSession, settings
     if callback.data is None or callback.from_user is None:  # pragma: no cover
         return
 
-    parsed = Ans.unpack(callback.data)
+    try:
+        parsed = Ans.unpack(callback.data)
+    except (TypeError, ValueError, ValidationError) as error:
+        # Фильтр роутера пропускает любую строку, начинающуюся с префикса
+        # фабрики, а `callback_data` приходит от клиента (§19.1). Разбор
+        # обязан отклонять такой ввод, а не падать: исключение здесь выходит
+        # наружу через наблюдатель `errors` и выглядит сбоем системы, причём
+        # нажатие остаётся неподтверждённым — §19.1 требует обратного.
+        log.info("callback_not_parsed", data=callback.data, reason=type(error).__name__)
+        await callback.answer(BROKEN_QUESTION, show_alert=True)
+        return
+
     await callback.answer()
 
     user_id = await _user_id(session, callback.from_user.id)

@@ -12,9 +12,27 @@
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Annotated, Final
 
 from aiogram.filters.callback_data import CallbackData
+from pydantic import Field
+
+BIGINT_MAX: Final = 2**63 - 1
+"""Предел `bigint` — типа ключей §3 (ADR-0004).
+
+Нужен границей в схеме, а не проверкой в хендлере: `callback_data` приходит от
+клиента, и `si` сверх этого предела доходил бы до запроса, где Postgres
+отвечает `value out of range`. Исключение драйвера в хендлере выглядит сбоем
+системы, а не отклонённым вводом.
+"""
+
+MAX_OPTION_INDEX: Final = 3
+"""Наибольший индекс варианта MCQ. §9.2: «вариантов mcq не более 4».
+
+Ограничение платформы, не качества, — но для разбора `callback_data` это
+нижняя и верхняя граница допустимого `v`, и проверять её схемой дешевле, чем
+ловить несуществующий вариант проверкой ответа.
+"""
 
 IDK: Final = -1
 """Значение `v`, означающее «не знаю». §19.1 дословно: «v = -1».
@@ -33,8 +51,14 @@ class Ans(CallbackData, prefix="a"):
     нового сеанса. §38 №8 требует обратного — старый callback не должен
     менять данные, и для этого он обязан указывать на конкретную строку.
 
-    `v` — индекс варианта с нуля либо `IDK`.
     """
 
-    si: int
-    v: int
+    si: Annotated[int, Field(gt=0, le=BIGINT_MAX)]
+    v: Annotated[int, Field(ge=IDK, le=MAX_OPTION_INDEX)]
+    """Индекс варианта с нуля либо `IDK`.
+
+    Границы объявлены схемой: `pydantic` отклонит значение раньше, чем оно
+    дойдёт до запроса или до проверки ответа. Разбор мусорного
+    `callback_data` — это `ValidationError`, а не `DBAPIError` в середине
+    обработки.
+    """

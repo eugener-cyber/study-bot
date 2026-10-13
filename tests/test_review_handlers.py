@@ -13,6 +13,7 @@ import datetime
 import pytest
 from aiogram.types import CallbackQuery, Chat, Message
 from aiogram.types import User as TgUser
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -503,3 +504,59 @@ async def test_questions_shown_count_grows_once_per_delivery(
 
     assert len(sent.texts) == 2, "второй /review не выдал задание"
     assert total == 1
+
+
+GARBAGE_CALLBACKS = [
+    ("a:", "нет полей"),
+    ("a:1", "одно поле вместо двух"),
+    ("a:1:2:3", "лишнее поле"),
+    ("a:abc:1", "не число"),
+    ("a:9999999999999999999999:0", "за пределом bigint"),
+    ("a:1:9", "варианта с таким номером не бывает — §9.2"),
+    ("a:0:0", "нулевой идентификатор"),
+]
+
+
+@pytest.mark.parametrize(("data", "reason"), GARBAGE_CALLBACKS)
+def test_garbage_callback_data_is_refused_by_the_factory(data: str, reason: str) -> None:
+    """Фабрика §19.1 отклоняет мусор сама, не доводя его до запроса.
+
+    Фильтр роутера пропускает любую строку с префиксом `a:`, а `callback_data`
+    приходит от клиента. Без границ в схеме `si` сверх предела `bigint`
+    доходил бы до базы, где Postgres отвечает `value out of range`, —
+    исключение драйвера в середине обработки выглядит сбоем системы, а не
+    отклонённым вводом.
+    """
+    with pytest.raises((TypeError, ValueError, ValidationError)):
+        Ans.unpack(data)
+
+
+@pytest.mark.parametrize(("data", "reason"), GARBAGE_CALLBACKS)
+async def test_garbage_callback_does_not_break_the_handler(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    settings: Settings,
+    data: str,
+    reason: str,
+) -> None:
+    """Мусорное нажатие подтверждается и объясняется, а не падает.
+
+    §19.1: нажатие обязано быть подтверждено. Исключение из хендлера уходит
+    наружу через наблюдатель `errors`, пользователь видит общий текст о сбое,
+    а кнопка остаётся с часиками — то есть ровно то, от чего §19.1 защищает.
+    """
+    await _due_facts(engine)
+    sent = Sent()
+
+    async with sessions() as session:
+        await handle_review(_message(sent), session, settings)
+        await session.commit()
+
+    async with sessions() as session:
+        await handle_answer(_callback(sent, data), session, settings)
+        await session.commit()
+
+    assert sent.order.count("ack") == 1, f"{reason}: нажатие не подтверждено ровно один раз"
+    assert BROKEN_QUESTION in sent.alerts
+    assert "edit" not in sent.order, "разбор показан на неразобранном нажатии"
