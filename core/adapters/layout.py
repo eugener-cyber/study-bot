@@ -21,8 +21,24 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Final
 
+from core.logging import get_logger
+
+log = get_logger(__name__)
+
 MAX_FRAGMENT_TOKENS: Final = 900
-"""§5.2 п. 3: верхняя граница склейки. Обязательна."""
+"""§5.2 п. 3 (v3.16): верхняя граница **склейки**. Обязательна для неё.
+
+Границу ограничивает склейка, а не абзац: один блок длиннее 900 токенов
+разрезать «по границам абзацев» невозможно, и он уходит во фрагмент целиком с
+записью в журнал (`block_exceeds_max_tokens`). Решение Архитектора 2026-10-14
+по замечанию ревью PR #42: резать такой блок по предложениям или по счёту
+токенов запрещено — `bbox` фрагмента есть объединение bbox его блоков, у двух
+частей одного блока он был бы одинаковым, и подсветка §23 указывала бы на весь
+абзац вместо нужного места.
+
+Замер на проверенном материале: 96 блоков, максимум 153 токена, медиана 17.5 —
+то есть ветвь редкая, но её последствие теперь названо, а не выбрано молча.
+"""
 
 MIN_FRAGMENT_TOKENS: Final = 600
 """§5.2 п. 3: нижняя граница — **не** обязательна.
@@ -218,6 +234,11 @@ def glue(
             # `locator.heading` блоков под ним.
             continue
         tokens = count_tokens(block.text)
+        if tokens > MAX_FRAGMENT_TOKENS:
+            # §5.2 п. 3 (v3.16): неделимый блок уходит во фрагмент целиком.
+            # Запись в журнал — то, что отличает названное последствие от
+            # молчаливого превышения границы.
+            log.info("block_exceeds_max_tokens", page=block.page, tokens=tokens)
 
         breaks_page = bool(batch) and block.page != batch[0].page
         breaks_heading = bool(batch) and heading != batch_heading

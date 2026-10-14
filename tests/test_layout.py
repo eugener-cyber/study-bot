@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import pytest
+from structlog.testing import capture_logs
 
 from core.adapters.layout import (
     MAX_FRAGMENT_TOKENS,
@@ -99,6 +100,43 @@ def test_upper_bound_is_enforced_and_a_long_fragment_actually_appears() -> None:
     assert (
         850 <= max(piece.tokens for piece in pieces) <= MAX_TOKENS
     ), "граница не достигнута — проверка «не больше 900» ничего не доказывает"
+
+
+def test_an_indivisible_block_goes_whole_and_is_named_in_the_journal() -> None:
+    """§5.2 п. 3 (v3.16): абзац длиннее 900 токенов не режется.
+
+    Решение Архитектора 2026-10-14 по замечанию ревью PR #42: граница
+    ограничивает склейку, а неделимый блок уходит во фрагмент целиком — резать
+    его по предложениям нельзя, иначе два фрагмента получат один и тот же
+    `bbox`. До правки граница нарушалась молча, и докстрока константы
+    утверждала обратное тому, что делал код.
+
+    Запись в журнал — вторая половина решения: без неё превышение остаётся
+    невидимым. Замер этой фикстуры: 1023 токена в блоке.
+    """
+    paragraph = "Неделимый абзац про раскрой ткани без единого разрыва. " * 90
+    blocks = [_block(7, paragraph)]
+
+    with capture_logs() as logs:
+        pieces = glue(blocks, count_tokens=tokens_in)
+
+    assert len(pieces) == 1, "блок разрезан, хотя §5.2 п. 3 это запрещает"
+    assert pieces[0].text == paragraph.strip(), "текст абзаца изменён"
+    assert pieces[0].tokens > MAX_TOKENS
+    assert pieces[0].bbox == blocks[0].bbox
+
+    exceeded = [entry for entry in logs if entry["event"] == "block_exceeds_max_tokens"]
+    assert len(exceeded) == 1, "превышение границы не названо в журнале"
+    assert exceeded[0]["page"] == 7
+    assert exceeded[0]["tokens"] == pieces[0].tokens
+
+
+def test_a_block_within_the_bound_is_not_named_in_the_journal() -> None:
+    """Обратное направление: иначе запись стояла бы на каждом блоке."""
+    with capture_logs() as logs:
+        glue([_block(1, "Короткий абзац.")], count_tokens=tokens_in)
+
+    assert not [entry for entry in logs if entry["event"] == "block_exceeds_max_tokens"]
 
 
 def test_sparse_page_gives_a_fragment_below_the_lower_bound() -> None:
