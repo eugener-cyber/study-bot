@@ -273,3 +273,67 @@ async def test_new_material_starts_queued_with_empty_stages(
         assert material.status == "queued"
         assert list(material.completed_stages or []) == []
         assert material.mode == "full"
+
+
+async def test_merge_origin_adds_measurements_without_losing_sha256(
+    engine: AsyncEngine, sessions: async_sessionmaker[AsyncSession], clean_tables: None
+) -> None:
+    """§5.1: `SourceMeta.extra` уходит в `materials.origin`. Слиянием, не заменой.
+
+    В `origin` уже лежит `sha256`, по которому §4.4 находит дубликат, и
+    частичный индекс §3.1 стоит на `origin->>'sha256'`. Замена стёрла бы его, и
+    повторная загрузка того же файла создала бы второй материал.
+    """
+    from core.services.materials import merge_origin
+
+    user_id = await _user(engine, 4242)
+    async with session_scope(sessions) as session:
+        material, _ = await create_or_find(
+            session,
+            user_id=user_id,
+            kind="pdf",
+            title="teoria.pdf",
+            origin={"sha256": "abc123", "orig_name": "teoria.pdf"},
+        )
+        material_id = material.id
+
+    async with session_scope(sessions) as session:
+        await merge_origin(session, material_id, {"pages": 10, "vision_pending_pages": [3, 4]})
+
+    async with engine.connect() as connection:
+        origin = (
+            await connection.execute(select(Material.origin).where(Material.id == material_id))
+        ).scalar_one()
+
+    assert origin["sha256"] == "abc123", "ключ дубликата §4.4 потерян"
+    assert origin["orig_name"] == "teoria.pdf"
+    assert origin["pages"] == 10
+    assert origin["vision_pending_pages"] == [3, 4]
+
+
+async def test_merge_origin_with_nothing_to_add_changes_nothing(
+    engine: AsyncEngine, sessions: async_sessionmaker[AsyncSession], clean_tables: None
+) -> None:
+    """Пустой `extra` — штатный исход: у текстового материала измерений нет."""
+    from core.services.materials import merge_origin
+
+    user_id = await _user(engine, 4343)
+    async with session_scope(sessions) as session:
+        material, _ = await create_or_find(
+            session,
+            user_id=user_id,
+            kind="text",
+            title="conspect.md",
+            origin={"sha256": "zzz"},
+        )
+        material_id = material.id
+
+    async with session_scope(sessions) as session:
+        await merge_origin(session, material_id, {})
+
+    async with engine.connect() as connection:
+        origin = (
+            await connection.execute(select(Material.origin).where(Material.id == material_id))
+        ).scalar_one()
+
+    assert origin == {"sha256": "zzz"}

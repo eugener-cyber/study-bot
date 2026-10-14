@@ -53,6 +53,30 @@ async def find_duplicate(session: AsyncSession, user_id: int, sha256: str) -> Ma
     ).scalar_one_or_none()
 
 
+async def merge_origin(session: AsyncSession, material_id: int, extra: dict[str, Any]) -> None:
+    """Дописывает измерения `probe` в `materials.origin`. §3, §5.1.
+
+    `SourceMeta.extra` по контракту §5.1 — «то, что пойдёт в
+    `materials.origin`»: число страниц, длительность, идентификатор видео. До
+    WP-06 потребителя у этого поля не было, и адаптер-заглушка его не
+    заполнял.
+
+    Слияние, а не замена: в `origin` уже лежат `sha256`, имя файла и путь, по
+    которым §4.4 находит дубликат (`Material.origin["sha256"]` в индексе §3.1).
+    Замена стёрла бы их, и повторная загрузка того же файла создала бы второй
+    материал.
+    """
+    if not extra:
+        return
+
+    current: dict[str, Any] | None = (
+        await session.execute(select(Material.origin).where(Material.id == material_id))
+    ).scalar_one()
+    merged = {**(current or {}), **extra}
+    await session.execute(update(Material).where(Material.id == material_id).values(origin=merged))
+    log.info("origin_merged", material_id=material_id, keys=sorted(extra))
+
+
 async def create_or_find(
     session: AsyncSession,
     *,

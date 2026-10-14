@@ -31,10 +31,12 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.adapters.base import ExtractedFragment, SourceMeta
+from core.adapters.factory import build_adapter, kind_for_path
+from core.adapters.pdf import VISION_PENDING_KEY
 from core.adapters.stub import StubAdapter
 from core.config import Settings, load_settings
 from core.db.engine import build_engine, build_sessionmaker
-from core.db.models import User
+from core.db.models import Fragment, Material, User
 from core.db.session import session_scope
 from core.ingest import handlers as h
 from core.ingest.pipeline import StageHandler, process_material
@@ -43,7 +45,7 @@ from core.learning.explain import format_duration
 from core.learning.rating import Rating
 from core.learning.scheduler import FixedIntervalScheduler
 from core.logging import configure_logging, get_logger
-from core.services.materials import create_or_find, mark_ready, sha256_of
+from core.services.materials import create_or_find, mark_ready, merge_origin, sha256_of
 from core.services.sessions import (
     AnswerResult,
     ItemView,
@@ -106,9 +108,16 @@ async def seed(file_path: str, tg_id: int | None = None) -> int:
     if not path.is_file():
         raise SystemExit(f"файл не найден: {file_path}")
 
-    fragments = fragments_from_text(path)
-    if not fragments:
-        raise SystemExit(f"файл пуст или не разбился на абзацы: {file_path}")
+    kind = kind_for_path(str(path))
+    adapter = build_adapter(kind, settings=settings)
+    fragments: list[ExtractedFragment] = []
+    if adapter is None:
+        # Текстовый материал: §5 адаптера для него не вводит, разбирает сам
+        # харнесс. Читать как текст **до** проверки типа нельзя — PDF падал бы
+        # на `read_text` с `UnicodeDecodeError`, что и происходило до WP-06.
+        fragments = fragments_from_text(path)
+        if not fragments:
+            raise SystemExit(f"файл пуст или не разбился на абзацы: {file_path}")
 
     owner_tg_id = tg_id if tg_id is not None else settings.ALLOWED_USER_IDS[0]
 
@@ -122,7 +131,7 @@ async def seed(file_path: str, tg_id: int | None = None) -> int:
             material, duplicate = await create_or_find(
                 session,
                 user_id=user_id,
-                kind="text",
+                kind=kind,
                 title=path.name,
                 origin={
                     "sha256": sha256_of(path),
@@ -134,10 +143,20 @@ async def seed(file_path: str, tg_id: int | None = None) -> int:
             if duplicate:
                 print(f"материал уже есть: id={material_id} — §4.4, копия не создаётся")
 
-        adapter = StubAdapter(
-            meta=SourceMeta(text_chars=len(path.read_text(encoding="utf-8"))),
-            fragments=fragments,
-        )
+        if adapter is None:
+            adapter = StubAdapter(
+                meta=SourceMeta(text_chars=sum(len(item.text or "") for item in fragments)),
+                fragments=fragments,
+            )
+        else:
+            # Замер источника и запись его в `materials.origin` (§5.1): число
+            # страниц и страницы, ждущие vision. Гейт бюджета §6.3 здесь
+            # **не** вызывается сознательно: он задаёт вопрос человеку и ждёт
+            # нажатия кнопки, а у консоли спрашивать некого — в воркере он
+            # остаётся на месте (`core/ingest/gate.py`).
+            meta = await adapter.probe(str(path))
+            async with session_scope(sessions) as session:
+                await merge_origin(session, material_id, meta.extra)
         await process_material(
             sessions,
             storage,
@@ -152,8 +171,97 @@ async def seed(file_path: str, tg_id: int | None = None) -> int:
     finally:
         await engine.dispose()
 
-    print(f"готово: material_id={material_id}, фрагментов={len(fragments)}")
+    print(f"готово: material_id={material_id}, тип={kind}")
     return material_id
+
+
+async def dump_material(material_id: int) -> int:
+    """Печатает фрагменты материала читаемо. План §1.4, критерий WP-06.
+
+    Нужен ровно потому, что агент не видит ни Telegram, ни базы глазами: §1.4
+    Плана называет консоль «основным способом разработки». Здесь — то, по чему
+    судят о качестве разбора PDF: номер страницы, заголовок, качество, число
+    токенов и начало текста.
+
+    Страницы, ждущие vision, печатаются отдельной строкой: §6.3 требует, чтобы
+    последствия были видимыми, а до PR B пакета такие страницы пропускаются.
+    """
+    settings = load_settings()
+    engine = build_engine(settings.DATABASE_URL)
+    sessions = build_sessionmaker(engine)
+
+    try:
+        async with session_scope(sessions) as session:
+            row = (
+                await session.execute(
+                    select(Material.kind, Material.status, Material.origin).where(
+                        Material.id == material_id
+                    )
+                )
+            ).first()
+            if row is None:
+                print(f"материала id={material_id} нет")
+                return 1
+            kind, status, origin = row
+
+            fragments = (
+                await session.execute(
+                    select(
+                        Fragment.ord,
+                        Fragment.kind,
+                        Fragment.locator,
+                        Fragment.quality,
+                        Fragment.tokens,
+                        Fragment.text,
+                    )
+                    .where(Fragment.material_id == material_id)
+                    .order_by(Fragment.ord)
+                )
+            ).all()
+
+        print(f"материал {material_id}: тип={kind}, статус={status}, фрагментов={len(fragments)}")
+        pending = list((origin or {}).get(VISION_PENDING_KEY) or [])
+        if pending:
+            print(
+                f"страниц без текстового слоя: {len(pending)} — "
+                f"{', '.join(str(page) for page in pending)}; "
+                "они ждут распознавания и заданий пока не дают"
+            )
+        print()
+        for ord_, frag_kind, locator, quality, tokens, text in fragments:
+            print(_fragment_line(ord_, frag_kind, locator or {}, quality, tokens, text))
+    finally:
+        await engine.dispose()
+    return 0
+
+
+def _fragment_line(
+    ord_: int,
+    kind: str | None,
+    locator: dict[str, object],
+    quality: float | None,
+    tokens: int | None,
+    text: str | None,
+) -> str:
+    """Одна строка вывода `dump-material`.
+
+    Форма зависит от варианта локатора §3.4: у `pdf` это страница, у `image` —
+    ассет и область. Неизвестный вариант печатается как есть, а не
+    пропускается: пропуск скрыл бы фрагмент, который существует.
+    """
+    where = {
+        "pdf": lambda: f"стр. {locator.get('page')}",
+        "image": lambda: f"ассет {locator.get('asset_id')}",
+        "web": lambda: f"«{str(locator.get('quote') or '')[:40]}»",
+    }.get(str(locator.get("type")), lambda: f"локатор {locator.get('type')}")()
+
+    heading = locator.get("heading")
+    head = f" [{heading}]" if heading else ""
+    body = " ".join((text or "").split())[:80]
+    return (
+        f"{ord_:>3}. {kind or '?':<6} {where:<16}{head} "
+        f"q={quality if quality is not None else '?'} t={tokens or 0}\n     {body}"
+    )
 
 
 async def show_session(tg_id: int | None = None) -> int:
@@ -389,6 +497,9 @@ def main() -> None:
     session_parser = sub.add_parser("session", help="собрать сеанс и показать задание")
     session_parser.add_argument("--tg-id", type=int, default=None, help="Telegram id")
 
+    dump_parser = sub.add_parser("dump-material", help="показать фрагменты материала")
+    dump_parser.add_argument("material_id", type=int, help="идентификатор материала")
+
     answer_parser = sub.add_parser("answer", help="ответить на текущее задание")
     answer_parser.add_argument("--option", type=int, default=None, help="номер варианта, с 1")
     answer_parser.add_argument("--idk", action="store_true", help="«не знаю» (§20)")
@@ -397,6 +508,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "seed":
         asyncio.run(seed(args.file, args.tg_id))
+    elif args.command == "dump-material":
+        raise SystemExit(asyncio.run(dump_material(args.material_id)))
     elif args.command == "session":
         raise SystemExit(asyncio.run(show_session(args.tg_id)))
     elif args.command == "answer":
