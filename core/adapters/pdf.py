@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
-from pathlib import Path
 from typing import Any, Final
 
 import pymupdf
@@ -241,8 +240,3 @@ def _blocks_of(page: pymupdf.Page, human_page: int) -> list[Block]:
             )
         )
     return out
-
-
-def is_pdf(path: str) -> bool:
-    """Расширение — `.pdf`. Используется фабрикой адаптеров."""
-    return Path(path).suffix.lower() == ".pdf"
