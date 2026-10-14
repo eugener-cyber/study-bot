@@ -19,6 +19,7 @@ from core.adapters.base import IngestCtx
 from core.adapters.factory import build_adapter, kind_for_path
 from core.adapters.pdf import RENDER_DPI, VISION_PENDING_KEY, PdfAdapter
 from core.config import Settings
+from core.ingest.budget import estimate_from_probe
 from tests.conftest import ENV_STUB
 from tests.pdf_fixtures import (
     PAGE_ONE_MARKER,
@@ -181,6 +182,39 @@ async def test_full_scan_gives_no_fragments_so_the_stage_will_fail(
     fragments = await _fragments(adapter, scanned_pdf(tmp_path / "s.pdf"), tmp_path)
 
     assert fragments == []
+
+
+async def test_vision_ratio_from_probe_reaches_the_budget_estimate(
+    adapter: PdfAdapter, settings: Settings, tmp_path: Path
+) -> None:
+    """§6.3: доля страниц под vision доходит до оценки, а не остаётся в мете.
+
+    Половинки этого свойства проверяются и по отдельности — `probe` отдаёт
+    0.5, а `tests/test_budget.py` считает цену по собранной руками `SourceMeta`
+    — но между ними нет ни одной проверки, и именно стык обещал план.
+    Оценка берётся из `core/ingest/budget.py`, а не пересчитывается тестом:
+    пересчёт повторил бы ошибку расчёта, если она там есть.
+
+    Сравниваются два файла одинаковой длины в страницах — смешанный и
+    целиком текстовый, — потому что абсолютное число ничего не доказывает:
+    §6.3 требует, чтобы страница под vision стоила **дороже** текстовой.
+    """
+    mixed = await adapter.probe(str(mixed_pdf(tmp_path / "m.pdf")))
+    text = await adapter.probe(str(text_pdf(tmp_path / "t.pdf")))
+
+    assert mixed.pages == text.pages == 2, "сравнение имеет смысл при равном числе страниц"
+    assert mixed.vision_pages_ratio > text.vision_pages_ratio == 0.0
+
+    mixed_cost = estimate_from_probe(mixed, settings)
+    text_cost = estimate_from_probe(text, settings)
+
+    assert mixed_cost.est_tokens > text_cost.est_tokens
+
+    # Замер при этих настройках: 6050 токенов против 3950. Сравнивается
+    # `est_tokens`, а не `est_cost`: провайдер в тестовых настройках —
+    # `manual` (§2.1), у него прайс нулевой, и цена обеих оценок равна нулю,
+    # то есть ассерт по цене не различал бы ничего.
+    assert mixed_cost.est_cost == text_cost.est_cost == 0
 
 
 # --- рендер §5.2 п. 2, §23 -------------------------------------------------
