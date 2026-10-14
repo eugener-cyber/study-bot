@@ -21,6 +21,7 @@ from arq import ArqRedis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.progress import ProgressMessage, stage_text
+from core.adapters.factory import IMAGE_KIND, known_kind_for_path
 from core.ingest.awaiting import remember_message
 from core.logging import get_logger
 from core.services.materials import create_or_find, sha256_of
@@ -61,16 +62,16 @@ def _kind_of(message: Message) -> str | None:
     `None` означает «не поддерживается здесь» — не ошибку. Аудио и видео
     появятся в WP-19 и WP-20, ссылки в WP-22, и до тех пор ответ о них должен
     быть внятным.
+
+    Соответствие «расширение → тип» берётся из фабрики адаптеров, а не
+    выводится здесь: второй вывод одной карты уже расходился с первым —
+    фотография получала тип `image` здесь и `text` в фабрике (замечание ревью
+    PR #42).
     """
     if message.document:
-        name = (message.document.file_name or "").lower()
-        if name.endswith(".pdf"):
-            return "pdf"
-        if name.endswith((".md", ".txt")):
-            return "text"
-        return None
+        return known_kind_for_path((message.document.file_name or "").lower())
     if message.photo:
-        return "image"
+        return IMAGE_KIND
     return None
 
 

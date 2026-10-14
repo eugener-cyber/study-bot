@@ -16,7 +16,7 @@ import pymupdf
 import pytest
 
 from core.adapters.base import IngestCtx
-from core.adapters.factory import build_adapter, kind_for_path
+from core.adapters.factory import build_adapter, kind_for_path, known_kind_for_path
 from core.adapters.pdf import RENDER_DPI, VISION_PENDING_KEY, PdfAdapter
 from core.config import Settings
 from core.ingest.budget import estimate_from_probe
@@ -343,7 +343,43 @@ def test_factory_returns_none_for_text_material(settings: Settings) -> None:
 
 @pytest.mark.parametrize(
     ("name", "kind"),
-    [("a.pdf", "pdf"), ("A.PDF", "pdf"), ("conspect.md", "text"), ("notes.txt", "text")],
+    [
+        ("a.pdf", "pdf"),
+        ("A.PDF", "pdf"),
+        ("conspect.md", "text"),
+        ("notes.txt", "text"),
+        ("photo-ab12cd34.jpg", "image"),
+        ("scan.JPEG", "image"),
+        ("page.png", "image"),
+        ("shot.webp", "image"),
+    ],
 )
 def test_kind_is_decided_by_extension(name: str, kind: str) -> None:
     assert kind_for_path(name) == kind
+
+
+def test_unknown_extension_is_text_for_the_harness_and_none_for_the_chat() -> None:
+    """Одна карта, две политики на неизвестном расширении — и обе названы.
+
+    `make seed` читает как текст что угодно: это его назначение. Приём файла
+    из чата обязан отказать внятно (§19.4), иначе `.docx` молча стал бы
+    текстовым материалом.
+    """
+    assert kind_for_path("report.docx") == "text"
+    assert known_kind_for_path("report.docx") is None
+    assert known_kind_for_path("a.pdf") == "pdf"
+
+
+def test_factory_refuses_a_kind_whose_adapter_has_not_arrived(settings: Settings) -> None:
+    """Тип без адаптера — отказ с именем пакета, а не `None`.
+
+    `None` означал бы «разбирает харнесс», и материал-изображение уходил бы в
+    текстовую заглушку: ноль фрагментов и отказ стадии с причиной, из которой
+    не видно, что тип просто не поддержан.
+    """
+    with pytest.raises(ValueError, match="WP-06 PR C"):
+        build_adapter("image", settings=settings)
+    with pytest.raises(ValueError, match="WP-19"):
+        build_adapter("audio", settings=settings)
+    with pytest.raises(ValueError, match="неизвестный тип"):
+        build_adapter("хогвартс", settings=settings)

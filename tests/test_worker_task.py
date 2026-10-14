@@ -16,7 +16,7 @@ import pytest
 from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from core.adapters.pdf import VISION_PENDING_KEY
+from core.adapters.pdf import VISION_PENDING_KEY, PdfAdapter
 from core.adapters.stub import StubAdapter
 from core.db.models import Material, User
 from core.db.session import session_scope
@@ -252,6 +252,51 @@ async def test_progress_message_id_is_none_for_seeded_material(
     material_id = await _material(engine)
     async with session_scope(sessions) as session:
         assert await progress_message_id(session, material_id) is None
+
+
+# --- Выбор адаптера по materials.kind (§3, §5.1) --------------------------
+
+
+def test_adapter_is_picked_by_kind_and_not_by_file_extension() -> None:
+    """§3: тип материала — это `materials.kind`, а не расширение пути.
+
+    Пара проверена накрест: для `kind = "pdf"` путь с расширением `.md`, для
+    `kind = "text"` — путь с `.pdf`. При выборе по пути обе проверки
+    провалились бы, при выборе по типу обе проходят.
+    """
+    import worker
+
+    settings = _settings()
+
+    assert isinstance(worker._adapter_for("pdf", "/tmp/конспект.md", settings), PdfAdapter)
+    assert isinstance(worker._adapter_for("text", "/tmp/lecture.pdf", settings), StubAdapter)
+
+
+async def test_task_refuses_a_kind_whose_adapter_has_not_arrived(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """Тип без адаптера даёт внятный отказ, а не пустую обработку.
+
+    Этот тест и есть доказательство, что тип читается **из базы**: путь файла
+    здесь `/tmp/none.md`, то есть при выборе по расширению материал ушёл бы в
+    текстовую заглушку и дошёл бы до стадий, а по `kind = "image"` фабрика
+    отказывает с именем пакета, в котором адаптер приедет.
+    """
+    import worker
+
+    material_id = await _material(engine, tg_id=1303)
+    async with engine.begin() as connection:
+        await connection.execute(
+            Material.__table__.update().where(Material.id == material_id).values(kind="image")
+        )
+
+    with pytest.raises(ValueError, match="WP-06 PR C"):
+        await worker.process_material_task(_ctx(sessions, tmp_path), material_id, "/tmp/none.md")
+
+    assert (await _status_and_error(engine, material_id))[0] == "failed"
 
 
 # --- Сообщение о готовности называет пропущенные страницы (§6.3) ----------

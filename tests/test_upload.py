@@ -13,6 +13,7 @@ from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from bot.handlers.upload import NO_CONSENT, UNSUPPORTED_KIND, _kind_of, handle_material
+from core.adapters.factory import BY_EXTENSION, kind_for_path
 from core.db.models import Material, User
 from core.db.session import session_scope
 
@@ -86,6 +87,26 @@ def test_unsupported_document_gives_none_not_error() -> None:
     """
     assert _kind_of(_message(document=_document("lecture.mp3"))) is None
     assert _kind_of(_message(text="просто текст")) is None
+
+
+def test_kind_of_a_photo_matches_what_the_factory_gives_for_the_saved_name() -> None:
+    """Приём и фабрика выводят тип по одной карте. Замечание ревью PR #42.
+
+    Фотография сохраняется под именем `photo-<id>.jpg` (ниже в этом же
+    хендлере), и до правки она получала `image` здесь и `text` в фабрике — то
+    есть воркер выбирал адаптер не для того типа, который записан в базе.
+    Тест сравнивает два вывода напрямую: при расхождении он краснеет, а не
+    ждёт появления адаптера изображений в PR C.
+    """
+    photo = [PhotoSize(file_id="ab12cd34", file_unique_id="u", width=1, height=1)]
+
+    assert _kind_of(_message(photo=photo)) == kind_for_path("photo-ab12cd34.jpg")
+
+
+def test_kind_of_a_document_matches_the_factory_map() -> None:
+    """То же для документов: тип берётся из `BY_EXTENSION`, а не выводится заново."""
+    for name in ("lecture.pdf", "конспект.md", "notes.txt"):
+        assert _kind_of(_message(document=_document(name))) == BY_EXTENSION[Path(name).suffix]
 
 
 # --- Согласие -------------------------------------------------------------
