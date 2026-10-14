@@ -164,11 +164,14 @@ class PdfAdapter(SourceAdapter):
     def render_page(self, path: str, page: int) -> bytes:
         """Страница в PNG 150 dpi. §5.2 п. 2, §23.
 
-        `page` — человеческий номер, с единицы, как в локаторе §3.4.
+        `page` — человеческий номер, с единицы, как в локаторе §3.4. Номер вне
+        документа — `ValueError`; почему отказ, а не чужая страница, сказано у
+        `_page_index`.
         """
         document = pymupdf.open(path)
         try:
-            pixmap = document.load_page(page - 1).get_pixmap(dpi=RENDER_DPI)
+            index = _page_index(page, document.page_count)
+            pixmap = document.load_page(index).get_pixmap(dpi=RENDER_DPI)
             return bytes(pixmap.tobytes("png"))
         finally:
             document.close()
@@ -181,12 +184,31 @@ class PdfAdapter(SourceAdapter):
         """
         document = pymupdf.open(path)
         try:
-            target = document.load_page(page - 1)
+            target = document.load_page(_page_index(page, document.page_count))
             target.draw_rect(pymupdf.Rect(*bbox), color=HIGHLIGHT_COLOR, width=HIGHLIGHT_WIDTH)
             pixmap = target.get_pixmap(dpi=RENDER_DPI)
             return bytes(pixmap.tobytes("png"))
         finally:
             document.close()
+
+
+def _page_index(page: int, page_count: int) -> int:
+    """Человеческий номер страницы → индекс PyMuPDF. Вне документа — отказ.
+
+    Проверка нужна не от небрежности вызывающего. PyMuPDF адресует
+    отрицательные индексы **с конца документа**, поэтому без неё `page = 0`
+    даёт `load_page(-1)` — последнюю страницу, без исключения. Замер на
+    двухстраничной фикстуре: `page = 0` отдавал байт-в-байт страницу 2, а
+    `page = -1` — страницу 1. Ни один ассерт такую подмену от правильного
+    ответа не отличит, а §23 и WP-11 будут рендерить по номерам **из базы**, а
+    не по только что собранным. Основание — ADR-0007 решение 3.
+    """
+    if not 1 <= page <= page_count:
+        raise ValueError(
+            f"номер страницы {page} вне документа: страницы нумеруются "
+            f"с единицы, их всего {page_count}"
+        )
+    return page - 1
 
 
 def _blocks_of(page: Any, human_page: int) -> list[Block]:

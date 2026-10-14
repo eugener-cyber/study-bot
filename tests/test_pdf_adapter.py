@@ -268,6 +268,29 @@ async def test_every_locator_turns_into_a_highlighted_page(
         assert image.height == A4_HEIGHT_AT_150_DPI
 
 
+async def test_render_refuses_a_page_number_outside_the_document(
+    adapter: PdfAdapter, tmp_path: Path
+) -> None:
+    """Номер вне документа — отказ, а не чужая страница.
+
+    `0` и `-1` проверяются отдельно от `3`: без проверки первые два **не
+    падают**, потому что PyMuPDF адресует отрицательные индексы с конца.
+    Замер до правки на этой же фикстуре: `page = 0` отдавал байт-в-байт
+    страницу 2, `page = -1` — страницу 1.
+    """
+    path = text_pdf(tmp_path / "t.pdf")
+    last = hashlib.sha256(adapter.render_page(str(path), 2)).hexdigest()
+
+    for bad in (0, -1, 3):
+        with pytest.raises(ValueError, match="вне документа"):
+            adapter.render_page(str(path), bad)
+        with pytest.raises(ValueError, match="вне документа"):
+            adapter.render_highlighted(str(path), bad, (0.0, 0.0, 10.0, 10.0))
+
+    # Положительная половина: отказ не достигнут тем, что рендер сломан вовсе.
+    assert hashlib.sha256(adapter.render_page(str(path), 2)).hexdigest() == last
+
+
 # --- фабрика §5.1 ----------------------------------------------------------
 
 
