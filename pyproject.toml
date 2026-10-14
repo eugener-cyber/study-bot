@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Telegram-бот: конспекты, задания и интервальное повторение по учебным материалам"
 requires-python = ">=3.12"
 dependencies = [
+    "pymupdf>=1.26",
+    "pillow>=10.0",
     "aiogram>=3.15",
     # alembic>=1.13 — нужна цель `alembic check` (появилась в 1.9), ею держится
     # правило «модели и миграции не расходятся» (План WP-02).
@@ -76,6 +78,17 @@ warn_unreachable = true
 
 # Тесты — вне строгой проверки: моки по природе возвращают Any, и строгость
 # на них даёт поток подавлений без пользы. Это не относится к bot/ и core/.
+# ТЗ §35 (v3.15): единственное исключение из --strict — модуль с PyMuPDF.
+# Замер: пробный файл из 18 строк даёт 4 ошибки (два вызова open, close,
+# итерация Document); у библиотеки возврат аннотирован у 150 определений из
+# 1173 при наличии py.typed, то есть --strict упирается в библиотеку, а не в
+# код проекта. Решение Архитектора 2026-10-14, Issue #38; причина и границы —
+# ADR-0007. Расползание на другие модули держит
+# test_pymupdf_lives_in_one_module: PyMuPDF разрешён ровно здесь.
+[[tool.mypy.overrides]]
+module = ["core.adapters.pdf"]
+disallow_untyped_calls = false
+
 [[tool.mypy.overrides]]
 module = ["tests.*"]
 ignore_errors = true
