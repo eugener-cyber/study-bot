@@ -211,7 +211,7 @@ def _page_index(page: int, page_count: int) -> int:
     return page - 1
 
 
-def _blocks_of(page: Any, human_page: int) -> list[Block]:
+def _blocks_of(page: pymupdf.Page, human_page: int) -> list[Block]:
     """Текстовые блоки страницы в структуры раскладки.
 
     Здесь и только здесь номер страницы переводится из нумерации PyMuPDF (с
@@ -228,11 +228,15 @@ def _blocks_of(page: Any, human_page: int) -> list[Block]:
         if not text:
             continue
         sizes = [float(span["size"]) for line in lines for span in (line.get("spans") or [])]
+        # Четвёрка распакована явно, а не собрана генератором: генератор даёт
+        # `tuple[float, ...]`, и под него пришлось бы ставить подавление
+        # `arg-type`. PyMuPDF отдаёт в `bbox` ровно четыре числа.
+        x0, y0, x1, y1 = (float(value) for value in block["bbox"])
         out.append(
             Block(
                 page=human_page,
                 text=text,
-                bbox=tuple(float(value) for value in block["bbox"]),  # type: ignore[arg-type]
+                bbox=(x0, y0, x1, y1),
                 size=max(sizes) if sizes else 0.0,
             )
         )
