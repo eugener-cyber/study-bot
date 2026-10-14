@@ -17,7 +17,7 @@ import pytest
 
 from core.adapters.base import IngestCtx
 from core.adapters.factory import build_adapter, kind_for_path, known_kind_for_path
-from core.adapters.pdf import RENDER_DPI, VISION_PENDING_KEY, PdfAdapter
+from core.adapters.pdf import RENDER_DPI, VISION_PENDING_KEY, NotAPdfError, PdfAdapter
 from core.config import Settings
 from core.ingest.budget import estimate_from_probe
 from tests.conftest import ENV_STUB
@@ -323,6 +323,52 @@ async def test_render_refuses_a_page_number_outside_the_document(
 
     # Положительная половина: отказ не достигнут тем, что рендер сломан вовсе.
     assert hashlib.sha256(adapter.render_page(str(path), 2)).hexdigest() == last
+
+
+# --- error case: не-PDF §5.1 -----------------------------------------------
+
+
+async def test_probe_and_extract_refuse_a_file_that_is_not_a_pdf(
+    adapter: PdfAdapter, tmp_path: Path
+) -> None:
+    """Материал, помеченный `pdf` по ошибке, отказывает, а не даёт мусор.
+
+    До правки `pymupdf.open` определял формат по расширению: замер на обычном
+    `notes.md` — документ из одной «страницы» и 11 символов текста, без
+    исключения. То есть материал уходил дальше по конвейеру с одним
+    бессмысленным фрагментом. Проверяются все четыре публичных входа — у
+    `probe` и `extract` error-case не было ни одного.
+    """
+    not_pdf = tmp_path / "notes.md"
+    not_pdf.write_text("Просто текстовый конспект, не PDF.\n", encoding="utf-8")
+
+    with pytest.raises(NotAPdfError):
+        await adapter.probe(str(not_pdf))
+    with pytest.raises(NotAPdfError):
+        await _fragments(adapter, not_pdf, tmp_path)
+    with pytest.raises(NotAPdfError):
+        adapter.render_page(str(not_pdf), 1)
+    with pytest.raises(NotAPdfError):
+        adapter.render_highlighted(str(not_pdf), 1, (0.0, 0.0, 10.0, 10.0))
+
+
+async def test_the_refusal_does_not_leak_the_pymupdf_exception_type(
+    adapter: PdfAdapter, tmp_path: Path
+) -> None:
+    """§35 и ADR-0007: тип библиотеки не уезжает из единственного модуля с ней.
+
+    Иначе поймать этот случай мог бы только тот, кто сам импортирует PyMuPDF —
+    то есть граница, которую держит `test_pymupdf_lives_in_one_module`, была бы
+    обойдена через тип исключения. Причина при этом сохранена в `__cause__`.
+    """
+    not_pdf = tmp_path / "notes.md"
+    not_pdf.write_text("Просто текстовый конспект, не PDF.\n", encoding="utf-8")
+
+    with pytest.raises(NotAPdfError) as caught:
+        await adapter.probe(str(not_pdf))
+
+    assert not isinstance(caught.value, pymupdf.FileDataError)
+    assert isinstance(caught.value.__cause__, pymupdf.FileDataError)
 
 
 # --- фабрика §5.1 ----------------------------------------------------------

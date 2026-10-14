@@ -55,6 +55,30 @@ VISION_PENDING_KEY: Final = "vision_pending_pages"
 """
 
 
+class NotAPdfError(Exception):
+    """Файл не PDF, хотя материал помечен типом `pdf`. §5.1.
+
+    Своё исключение, а не `pymupdf.FileDataError`: наружу из единственного
+    модуля с PyMuPDF не должен уезжать тип библиотеки — иначе её пришлось бы
+    импортировать всем, кто хочет этот случай поймать (§35, ADR-0007).
+    """
+
+
+def _open(path: str) -> pymupdf.Document:
+    """Открывает файл **как PDF**, а не по догадке о формате.
+
+    Без `filetype` PyMuPDF определяет формат по расширению и открывает что
+    угодно: замер на обычном `notes.md` — документ из одной «страницы» и 11
+    символов текста, без исключения. То есть материал, помеченный `pdf` по
+    ошибке, молча давал один бессмысленный фрагмент вместо отказа. Замечание
+    ревью PR #42.
+    """
+    try:
+        return pymupdf.open(path, filetype="pdf")
+    except pymupdf.FileDataError as error:
+        raise NotAPdfError(f"файл не читается как PDF: {path}") from error
+
+
 class PdfAdapter(SourceAdapter):
     """Текстовый слой PDF, локаторы §3.4 и рендер страниц.
 
@@ -77,7 +101,7 @@ class PdfAdapter(SourceAdapter):
         вызывает. Доля страниц под vision — главный множитель оценки §6.3
         (`core/ingest/budget.py`), и считать её нужно **до** `extract`.
         """
-        document = pymupdf.open(path)
+        document = _open(path)
         try:
             pages = document.page_count
             chars = 0
@@ -107,7 +131,7 @@ class PdfAdapter(SourceAdapter):
 
     async def _fragments(self, path: str) -> list[ExtractedFragment]:
         """Текстовые фрагменты всего документа. Вынесено ради `extract`."""
-        document = pymupdf.open(path)
+        document = _open(path)
         try:
             blocks: list[Block] = []
             for index in range(document.page_count):
@@ -167,7 +191,7 @@ class PdfAdapter(SourceAdapter):
         документа — `ValueError`; почему отказ, а не чужая страница, сказано у
         `_page_index`.
         """
-        document = pymupdf.open(path)
+        document = _open(path)
         try:
             index = _page_index(page, document.page_count)
             pixmap = document.load_page(index).get_pixmap(dpi=RENDER_DPI)
@@ -181,7 +205,7 @@ class PdfAdapter(SourceAdapter):
         Рамка рисуется поверх страницы перед рендером, сам файл не меняется:
         документ открыт на чтение и закрывается без сохранения.
         """
-        document = pymupdf.open(path)
+        document = _open(path)
         try:
             target = document.load_page(_page_index(page, document.page_count))
             target.draw_rect(pymupdf.Rect(*bbox), color=HIGHLIGHT_COLOR, width=HIGHLIGHT_WIDTH)
