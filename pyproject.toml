@@ -76,8 +76,6 @@ files = ["core", "bot", "alembic/env.py"]
 strict = true
 warn_unreachable = true
 
-# Тесты — вне строгой проверки: моки по природе возвращают Any, и строгость
-# на них даёт поток подавлений без пользы. Это не относится к bot/ и core/.
 # ТЗ §35 (v3.15): единственное исключение из --strict — модуль с PyMuPDF.
 # Замер: пробный файл из 18 строк даёт 4 ошибки (два вызова open, close,
 # итерация Document); у библиотеки возврат аннотирован у 150 определений из
@@ -89,6 +87,8 @@ warn_unreachable = true
 module = ["core.adapters.pdf"]
 disallow_untyped_calls = false
 
+# Тесты — вне строгой проверки: моки по природе возвращают Any, и строгость
+# на них даёт поток подавлений без пользы. Это не относится к bot/ и core/.
 [[tool.mypy.overrides]]
 module = ["tests.*"]
 ignore_errors = true
