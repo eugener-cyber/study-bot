@@ -161,6 +161,12 @@ class KeptPicture:
     picture: Picture
     group_id: str | None
     """Непустой у изображений пронумерованного набора «Рис. N» (§3.4, v3.15)."""
+    caption: Caption | None = None
+    """Подпись, которой изображение досталось, если она нашлась.
+
+    Нужна дальше адаптеру: текст подписи уходит в `media_assets.caption` (§3),
+    и пересчитывать привязку второй раз незачем.
+    """
 
 
 def union_bbox(
@@ -434,10 +440,18 @@ def keep_pictures(
                 # из одного элемента, который `match_image` собрать не может
                 # (§9.2 требует минимум двух пар).
                 if members[0].area_ratio > min_area_ratio:
-                    kept.append(KeptPicture(picture=members[0], group_id=None))
+                    kept.append(KeptPicture(picture=members[0], group_id=None, caption=first))
                 continue
             group_id = f"page{first.page}-fig{first.number}"
-            kept.extend(KeptPicture(picture=picture, group_id=group_id) for picture in members)
+            owners = {id(picture): caption for index, caption in run for picture in assigned[index]}
+            kept.extend(
+                KeptPicture(
+                    picture=picture,
+                    group_id=group_id,
+                    caption=owners.get(id(picture)),
+                )
+                for picture in members
+            )
 
     kept.extend(
         KeptPicture(picture=picture, group_id=None)

@@ -160,3 +160,111 @@ def zero_page_pdf(path: Path) -> Path:
     """
     path.write_text(_MINIMAL_PDF.format(count=0), encoding="ascii")
     return path
+
+
+CYRILLIC_FONTS = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+)
+"""Где искать шрифт с кириллицей для подписей «Рис. N».
+
+Встроенные шрифты PyMuPDF (base-14) кириллицы не несут — замер: «Рис. 1»
+извлекается как «···. 1». Файл шрифта в репозиторий не кладётся (ADR-0007
+решение 7), поэтому берётся системный, а тест, которому он нужен,
+пропускается, если ни одного нет. Проверяется именно то, ради чего кириллица
+нужна: что подпись доходит из разбора PDF до правила набора.
+"""
+
+
+def cyrillic_font() -> str | None:
+    """Путь к системному шрифту с кириллицей или `None`."""
+    for candidate in CYRILLIC_FONTS:
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def _fill_text_layer(page: pymupdf.Page, text: str) -> None:
+    """Добавляет странице текстовый слой длиннее `SCAN_TEXT_THRESHOLD`.
+
+    Без него страница с картинками подпадает под детект скана §5.2 п. 2 —
+    «менее 100 символов текста при непустом изображении», — и адаптер её
+    пропустит. На фикстурах PR A этот же урок стоил зелёного прогона: текста в
+    них заведомо больше порога, и здесь по той же причине.
+    """
+    page.insert_textbox(
+        pymupdf.Rect(60, page.rect.height - 180, page.rect.width - 60, page.rect.height - 60),
+        text,
+        fontsize=BODY_SIZE,
+        fontname="helv",
+    )
+
+
+def _png_bytes(width: int, height: int, colour: tuple[int, int, int]) -> bytes:
+    """Однотонный PNG нужного размера. Через PyMuPDF, чтобы не плодить зависимости."""
+    pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, width, height))
+    pixmap.set_rect(pixmap.irect, colour)
+    return bytes(pixmap.tobytes("png"))
+
+
+def figures_pdf(path: Path, *, caption_prefix: str = "Ris.") -> Path:
+    """Страница с набором «Рис. 1, 2, 3» и страница с одиночным изображением.
+
+    Собирается кодом, как и остальные фикстуры (ADR-0007 решение 7). Что в ней
+    важно для §5.2 п. 4:
+
+    - три мелких изображения в ряд, под каждым своя подпись «Ris. N» — то есть
+      **первый** признак набора, и площадь каждого ниже порога §30.3;
+    - три картинки набора **разные**: одинаковые байты PDF хранит одним
+      объектом, и дедупликация по `xref` схлопнула бы набор в один ассет — на
+      этом первая редакция фикстуры и попалась;
+    - на второй странице одно крупное изображение без подписи, размещённое
+      **дважды** и оба раза выше порога: так дедупликация проверяется
+      независимо от подписей (замер корпуса: 86 лишних размещений, максимум
+      31 копия).
+    """
+    document = pymupdf.open()
+    first = document.new_page()
+    font = cyrillic_font()
+    kwargs = (
+        {"fontname": "cap", "fontfile": font}
+        if caption_prefix != "Ris." and font is not None
+        else {"fontname": "helv"}
+    )
+    # Три **разных** изображения: одинаковые байты PDF хранит одним объектом, и
+    # дедупликация по `xref` схлопнула бы набор в один ассет — на этом первая
+    # редакция фикстуры и попалась.
+    for index, x in enumerate((60.0, 200.0, 340.0), start=1):
+        element = _png_bytes(40, 40, (10 * index, 60, 200))
+        first.insert_image(pymupdf.Rect(x, 100, x + 40, 140), stream=element)
+        first.insert_text((x, 160), f"{caption_prefix} {index}. Element", fontsize=9, **kwargs)
+    # Повторное размещение **первого** изображения — предмет дедупликации.
+    first.insert_image(pymupdf.Rect(60, 300, 100, 340), stream=_png_bytes(40, 40, (10, 60, 200)))
+    _fill_text_layer(first, BODY_ONE)
+
+    second = document.new_page()
+    big = _png_bytes(300, 300, (220, 40, 40))
+    # Дважды одно и то же изображение, и оба размещения **выше** порога §30.3:
+    # дедупликация видна без подписей, то есть и на фикстуре с латиницей.
+    second.insert_image(pymupdf.Rect(100, 100, 400, 400), stream=big)
+    second.insert_image(pymupdf.Rect(100, 450, 400, 750), stream=big)
+    _fill_text_layer(second, BODY_TWO)
+
+    document.save(str(path))
+    document.close()
+    return path
+
+
+def oversized_image_pdf(path: Path, *, side: int = 1800) -> Path:
+    """Страница с изображением, длинная сторона которого больше 1568 px.
+
+    1800, а не 3000: однотонный PNG 3000×1500 даёт файл на 13 МБ и замедляет
+    прогон, а для проверки ресайза достаточно превысить предел.
+    """
+    document = pymupdf.open()
+    page = document.new_page()
+    page.insert_image(page.rect, stream=_png_bytes(side, side // 2, (30, 160, 90)))
+    _fill_text_layer(page, BODY_ONE)
+    document.save(str(path))
+    document.close()
+    return path
