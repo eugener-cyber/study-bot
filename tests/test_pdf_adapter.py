@@ -343,6 +343,10 @@ async def _assets(adapter: PdfAdapter, path: Path, tmp_path: Path) -> list[Extra
     return [item async for item in adapter.assets(str(path), _ctx(tmp_path))]
 
 
+@pytest.mark.skipif(
+    cyrillic_font() is None,
+    reason="нет системного шрифта с кириллицей: подпись «Рис. N» не набрать",
+)
 async def test_assets_keep_the_numbered_set_and_drop_nothing_else(
     adapter: PdfAdapter, tmp_path: Path
 ) -> None:
@@ -354,11 +358,14 @@ async def test_assets_keep_the_numbered_set_and_drop_nothing_else(
 
     Это единственный тест, которому нужна **кириллица** в подписи: правило
     §5.2 п. 4 опознаёт форму «Рис. N», а встроенные шрифты PyMuPDF кириллицы
-    не несут. Берётся системный шрифт; без него тест пропускается, а не
-    подгоняет правило под латиницу.
+    не несут (замер: «Рис. 1» извлекается как «···. 1»). Берётся системный
+    шрифт, а не файл в репозитории (ADR-0007 решение 7).
+
+    Пропуск оформлен `skipif` с видимой причиной, и этого **недостаточно**:
+    пропущенный тест выглядит зелёным прогоном. Поэтому шрифт ставится в CI
+    отдельным шагом (`.github/workflows/ci.yml`) — иначе проверка правила на
+    настоящем разборе PDF не выполнялась бы там вовсе.
     """
-    if cyrillic_font() is None:
-        pytest.skip("в системе нет шрифта с кириллицей — подпись «Рис. N» не набрать")
     path = figures_pdf(tmp_path / "f.pdf", caption_prefix="Рис.")
 
     assets = await _assets(adapter, path, tmp_path)
