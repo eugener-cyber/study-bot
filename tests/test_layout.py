@@ -16,11 +16,15 @@ import pytest
 from structlog.testing import capture_logs
 
 from core.adapters.layout import (
+    CAPTION_MAX_CHARS,
     MAX_FRAGMENT_TOKENS,
     SCAN_TEXT_THRESHOLD,
     Block,
+    Caption,
     Picture,
     analyze_headings,
+    assign_captions,
+    captions_of,
     glue,
     is_scanned,
     keep_pictures,
@@ -250,13 +254,201 @@ def test_scan_detection_boundaries(chars: int, has_images: bool, expected: bool,
 # --- Изображения и правило группы §5.2 п. 4 --------------------------------
 
 
-def _picture(page: int, ratio: float, caption: str | None = None, *, y: float = 0.0) -> Picture:
+def _pic(
+    page: int,
+    ratio: float = 0.03,
+    *,
+    x0: float = 72.0,
+    y: float = 0.0,
+    width: float = 128.0,
+    height: float = 100.0,
+    xref: int = 1,
+) -> Picture:
     return Picture(
         page=page,
-        bbox=(72.0, y, 200.0, y + 100.0),
+        bbox=(x0, y, x0 + width, y + height),
         area_ratio=ratio,
-        caption=caption,
+        xref=xref,
     )
+
+
+def _cap(
+    page: int,
+    number: int,
+    *,
+    x0: float = 72.0,
+    y: float = 110.0,
+    width: float = 128.0,
+    text: str | None = None,
+) -> Caption:
+    return Caption(
+        page=page,
+        number=number,
+        bbox=(x0, y, x0 + width, y + 14.0),
+        text=text if text is not None else f"Рис. {number}. Подпись",
+    )
+
+
+# --- опознание подписи ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "is_caption", "why"),
+    [
+        ("Рис. 1. Виды графических элементов", True, "каноническая форма §5.2"),
+        ("Рис. 1", True, "после номера нет ничего — тоже подпись"),
+        ("Рис. 2 Фронтон Большого театра", True, "разделителя после номера нет"),
+        ("грейфера Рис.3. Модель захвата", True, "подпись склеена с концом строки разбором"),
+        ("рис. 1) женского платья", False, "обрывок фразы, а не подпись"),
+        ("Выберите элементы (рис.1).", False, "ссылка на рисунок внутри текста"),
+        ("Фото 1. Ткань", False, "§5.2 называет форму «Рис. N», догадываться за неё — §40"),
+    ],
+)
+def test_caption_form_is_recognised_by_measurement(text: str, is_caption: bool, why: str) -> None:
+    """Форма подписи — замер по корпусу, а не догадка. §5.2 п. 4.
+
+    Каждая строка взята из настоящих материалов: первые четыре правило обязано
+    брать, остальные — отбрасывать. На форме из PR A (`^рис N`) краснеют две:
+    «рис. 1)» становилась подписью, а склеенный блок — не становился.
+    """
+    blocks = [Block(page=1, text=text, bbox=(72.0, 100.0, 400.0, 114.0), size=10.0)]
+
+    assert bool(captions_of(blocks)) is is_caption, why
+
+
+def test_a_long_block_mentioning_a_figure_is_not_a_caption() -> None:
+    """Граница длины §5.2 п. 4 (замер): без неё подписями становятся абзацы.
+
+    Замер по корпусу: 10 блоков длиной до 2037 символов упоминают «рис. N» в
+    тексте. Самая длинная настоящая подпись — 57 символов.
+    """
+    long_text = "Заметать складку по линии середины, см. рис. 5 выше. " * 5
+    assert len(long_text) > CAPTION_MAX_CHARS
+
+    blocks = [Block(page=1, text=long_text, bbox=(72.0, 100.0, 500.0, 300.0), size=10.0)]
+
+    assert captions_of(blocks) == []
+
+
+# --- привязка подписи к изображениям --------------------------------------
+
+
+def test_cluster_under_one_caption_is_one_set() -> None:
+    """Второй признак набора: гроздь под одной подписью. §5.2 п. 4 v3.17.
+
+    Координаты — замер со стр. 10 файла живого прогона, той самой, которую
+    §5.2 приводит собственным примером: десять элементов пронумерованы голыми
+    числами, подпись одна. Правило PR A («ряд подписей») этот набор не
+    собирало ни при каком опознании подписи.
+    """
+    boxes = [
+        (162.1, 61.7, 282.9, 184.2),
+        (385.0, 61.7, 520.8, 184.1),
+        (162.4, 191.0, 282.5, 311.4),
+        (374.6, 191.0, 531.0, 317.4),
+        (150.9, 324.3, 293.9, 456.1),
+        (141.1, 462.9, 303.9, 590.8),
+        (386.8, 463.0, 518.9, 596.8),
+        (148.2, 603.6, 296.8, 729.0),
+        (388.2, 603.6, 517.5, 734.4),
+        (368.7, 326.0, 537.0, 447.3),
+    ]
+    pictures = [
+        Picture(page=10, bbox=box, area_ratio=0.03, xref=index + 1)
+        for index, box in enumerate(boxes)
+    ]
+    captions = [
+        Caption(
+            page=10,
+            number=1,
+            bbox=(140.9, 742.0, 480.0, 756.0),
+            text="Рис. 1. Виды графических элементов для выполнения задания",
+        )
+    ]
+
+    kept = keep_pictures(pictures, captions, min_area_ratio=MIN_AREA_RATIO)
+
+    assert len(kept) == 10, "гроздь собралась не целиком"
+    assert {item.group_id for item in kept} == {"page10-fig1"}
+
+
+def test_a_row_of_captions_in_columns_is_one_set() -> None:
+    """Первый признак: ряд подписей с непрерывной нумерацией сливается в набор.
+
+    Форма со стр. 27 `tasks-tech-10-prak`: три подписи стоят **в один ряд** в
+    трёх столбцах, у каждой своя картинка. Различаются они по горизонтали —
+    по вертикали они почти совпадают (замер: y0 = 384, 385, 391).
+    """
+    pictures = [_pic(27, x0=x, y=100.0, height=200.0) for x in (60.0, 220.0, 380.0)]
+    captions = [
+        _cap(27, number, x0=x, y=310.0) for number, x in ((1, 60.0), (2, 220.0), (3, 380.0))
+    ]
+
+    kept = keep_pictures(pictures, captions, min_area_ratio=MIN_AREA_RATIO)
+
+    assert len(kept) == 3
+    assert {item.group_id for item in kept} == {"page27-fig1"}
+
+
+def test_nearest_caption_is_chosen_among_candidates_not_globally() -> None:
+    """Пункт 3 правила: ближайшая **среди подходящих по пунктам 1–2**.
+
+    Координаты — замер стр. 27 `tasks-tech-10-prak-kddt-final-21-22.pdf`, и
+    взяты они именно оттуда не для красоты: на этой геометрии глобальное
+    прочтение правила даёт `{3: 3}` — все три картинки уходят к третьей
+    подписи, потому что она ближе по вертикали к низу каждой. Первая редакция
+    теста стояла на выдуманных координатах, где своя подпись была ближайшей и
+    при глобальном прочтении, то есть тест проходил **и при сломанном
+    правиле**; нашло ревью PR #47 мутацией реализации.
+
+    Числа: подписи `Рис.1` y0=384.2, `Рис.2` y0=385.0, `Рис.3` y0=391.0;
+    картинки с низом 388.9, 394.9 и 398.9. Правильное прочтение даёт каждой
+    картинке свою подпись — различает их **горизонталь**, а не вертикаль.
+    """
+    pictures = [
+        Picture(page=27, bbox=(71.0, 271.1, 188.8, 388.9), area_ratio=0.0277, xref=1),
+        Picture(page=27, bbox=(200.4, 271.1, 338.1, 394.9), area_ratio=0.0340, xref=2),
+        Picture(page=27, bbox=(347.2, 282.6, 555.3, 398.9), area_ratio=0.0483, xref=3),
+    ]
+    captions = [
+        Caption(page=27, number=1, bbox=(72.7, 384.2, 192.5, 398.2), text="Рис.1. Захват двух"),
+        Caption(page=27, number=2, bbox=(212.7, 385.0, 341.5, 399.0), text="Рис.2. Захват с двумя"),
+        Caption(page=27, number=3, bbox=(357.1, 391.0, 558.8, 405.0), text="Рис.3. Модель захвата"),
+    ]
+
+    assigned = assign_captions(pictures, captions)
+
+    assert {index: len(group) for index, group in assigned.items()} == {
+        0: 1,
+        1: 1,
+        2: 1,
+    }, "картинки ушли к чужой подписи — правило прочитано как «глобально ближайшая»"
+    assert assigned[0] == [pictures[0]]
+    assert assigned[1] == [pictures[1]]
+    assert assigned[2] == [pictures[2]]
+
+
+def test_a_picture_below_its_caption_is_not_attached() -> None:
+    """Пункт 2: подпись обязана начинаться ниже верха изображения.
+
+    Иначе подпись забирала бы картинку, стоящую под ней, — то есть
+    принадлежащую следующей подписи.
+    """
+    picture = _pic(1, y=200.0)
+    caption = _cap(1, 1, y=100.0)
+
+    assert assign_captions([picture], [caption]) == {0: []}
+
+
+def test_a_caption_without_pictures_does_not_break_the_rule() -> None:
+    """Замер корпуса: такие подписи есть. Правило обязано их переживать."""
+    captions = [_cap(9, 1)]
+
+    assert assign_captions([], captions) == {0: []}
+    assert keep_pictures([], captions, min_area_ratio=MIN_AREA_RATIO) == []
+
+
+# --- порог и наборы §5.2 п. 4, §30.3 --------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -272,7 +464,7 @@ def test_threshold_is_checked_at_its_own_boundary(ratio: float, kept: bool, why:
     Первая редакция этого теста брала 0.9% и 4% — такие значения прошли бы и
     при пороге 0.01, и при 0.03, то есть норму §30.3 тест не держал.
     """
-    result = keep_pictures([_picture(1, ratio)], min_area_ratio=MIN_AREA_RATIO)
+    result = keep_pictures([_pic(1, ratio)], min_area_ratio=MIN_AREA_RATIO)
 
     assert bool(result) is kept, why
 
@@ -284,35 +476,73 @@ def test_numbered_set_survives_below_the_threshold() -> None:
     и отброшенными оказались ровно наборы, ради которых существует
     `match_image`.
     """
-    pictures = [
-        _picture(7, 0.009, "Рис. 1. Прямая строчка", y=0.0),
-        _picture(7, 0.012, "Рис. 2. Зигзаг", y=120.0),
-        _picture(7, 0.008, "Рис. 3. Оверлок", y=240.0),
-    ]
+    pictures = [_pic(7, 0.009, y=float(index) * 120.0) for index in range(3)]
+    captions = [_cap(7, index + 1, y=float(index) * 120.0 + 105.0) for index in range(3)]
 
-    kept = keep_pictures(pictures, min_area_ratio=MIN_AREA_RATIO)
+    kept = keep_pictures(pictures, captions, min_area_ratio=MIN_AREA_RATIO)
 
     assert len(kept) == 3, "набор разорван порогом площади"
     assert {item.group_id for item in kept} == {"page7-fig1"}
 
 
+def test_a_cluster_below_the_threshold_survives_whole() -> None:
+    """Гроздь под одной подписью освобождена от порога §30.3, как и ряд.
+
+    План обещал этот тест отдельно от ряда подписей, и не зря: прежняя
+    проверка «набор ниже порога» стояла на **ряде** из трёх подписей, то есть
+    второй признак набора порогом не проверялся вовсе. Мутация «порог
+    применяется к грозди» не роняла ни одного теста — нашло ревью PR #47.
+
+    Девять картинок по 0.01 под одной подписью: без правила их отбросил бы
+    порог 0.02 целиком, и `match_image` остался бы без материала — ровно то,
+    против чего §5.2 п. 4 и вводился.
+    """
+    pictures = [_pic(6, 0.01, x0=60.0 + index * 50.0, y=100.0) for index in range(9)]
+    captions = [_cap(6, 1, x0=60.0, y=210.0, width=500.0)]
+
+    kept = keep_pictures(pictures, captions, min_area_ratio=MIN_AREA_RATIO)
+
+    assert len(kept) == 9, "гроздь ниже порога отброшена"
+    assert {item.group_id for item in kept} == {"page6-fig1"}
+
+
 def test_a_gap_in_numbering_starts_a_second_group() -> None:
     """Два набора на странице получают разные `group_id`.
 
-    Общий `group_id` означал бы, что `match_image` собёрет задание из двух
+    Общий `group_id` означал бы, что `match_image` соберёт задание из двух
     несвязанных иллюстраций.
     """
     pictures = [
-        _picture(7, 0.009, "Рис. 1", y=0.0),
-        _picture(7, 0.009, "Рис. 2", y=100.0),
-        _picture(7, 0.009, "Рис. 7", y=200.0),
-        _picture(7, 0.009, "Рис. 8", y=300.0),
+        _pic(7, 0.009, x0=60.0, y=100.0),
+        _pic(7, 0.009, x0=220.0, y=100.0),
+        _pic(7, 0.009, x0=60.0, y=400.0),
+        _pic(7, 0.009, x0=220.0, y=400.0),
+    ]
+    captions = [
+        _cap(7, 1, x0=60.0, y=210.0),
+        _cap(7, 2, x0=220.0, y=210.0),
+        _cap(7, 7, x0=60.0, y=510.0),
+        _cap(7, 8, x0=220.0, y=510.0),
     ]
 
-    kept = keep_pictures(pictures, min_area_ratio=MIN_AREA_RATIO)
+    kept = keep_pictures(pictures, captions, min_area_ratio=MIN_AREA_RATIO)
 
     assert len(kept) == 4
     assert {item.group_id for item in kept} == {"page7-fig1", "page7-fig7"}
+
+
+def test_duplicate_numbers_on_a_page_do_not_split_the_run() -> None:
+    """Дубль номера ряд не разрывает. На корпусе таких страниц нет ни одной.
+
+    Поведение названо здесь, а не выясняется на первом материале, где они
+    появятся: §5.2 о дублях молчит.
+    """
+    pictures = [_pic(4, 0.009, x0=60.0, y=100.0), _pic(4, 0.009, x0=220.0, y=100.0)]
+    captions = [_cap(4, 2, x0=60.0, y=210.0), _cap(4, 2, x0=220.0, y=210.0)]
+
+    kept = keep_pictures(pictures, captions, min_area_ratio=MIN_AREA_RATIO)
+
+    assert {item.group_id for item in kept} == {"page4-fig2"}
 
 
 def test_single_captioned_picture_is_not_a_group() -> None:
@@ -322,7 +552,7 @@ def test_single_captioned_picture_is_not_a_group() -> None:
     одиночной подписи означал бы набор, которым нельзя воспользоваться. Порог
     площади к такой картинке применяется как к любой одиночной.
     """
-    kept = keep_pictures([_picture(3, 0.05, "Рис. 4. Выкройка")], min_area_ratio=MIN_AREA_RATIO)
+    kept = keep_pictures([_pic(3, 0.05)], [_cap(3, 4)], min_area_ratio=MIN_AREA_RATIO)
 
     assert len(kept) == 1
     assert kept[0].group_id is None
@@ -330,29 +560,32 @@ def test_single_captioned_picture_is_not_a_group() -> None:
 
 def test_sets_on_different_pages_do_not_merge() -> None:
     pictures = [
-        _picture(2, 0.009, "Рис. 1", y=0.0),
-        _picture(2, 0.009, "Рис. 2", y=100.0),
-        _picture(5, 0.009, "Рис. 1", y=0.0),
-        _picture(5, 0.009, "Рис. 2", y=100.0),
+        _pic(2, 0.009, x0=60.0, y=100.0),
+        _pic(2, 0.009, x0=220.0, y=100.0),
+        _pic(5, 0.009, x0=60.0, y=100.0),
+        _pic(5, 0.009, x0=220.0, y=100.0),
+    ]
+    captions = [
+        _cap(2, 1, x0=60.0, y=210.0),
+        _cap(2, 2, x0=220.0, y=210.0),
+        _cap(5, 1, x0=60.0, y=210.0),
+        _cap(5, 2, x0=220.0, y=210.0),
     ]
 
-    kept = keep_pictures(pictures, min_area_ratio=MIN_AREA_RATIO)
+    kept = keep_pictures(pictures, captions, min_area_ratio=MIN_AREA_RATIO)
 
     assert {item.group_id for item in kept} == {"page2-fig1", "page5-fig1"}
 
 
-def test_caption_in_another_form_is_not_a_set() -> None:
-    """Распознаётся ровно форма §5.2 — «Рис. N».
+def test_pictures_without_captions_go_by_the_threshold_alone() -> None:
+    """Изображение вне набора живёт по порогу §30.3, и ничего больше."""
+    pictures = [_pic(1, 0.009), _pic(1, 0.05, y=300.0)]
 
-    «Фото 1» и «Схема 2» спецификация не называет, и догадываться за неё
-    §40 запрещает: такие картинки проходят по общему порогу площади.
-    """
-    pictures = [
-        _picture(1, 0.009, "Фото 1. Ткань", y=0.0),
-        _picture(1, 0.009, "Схема 2. Шов", y=100.0),
-    ]
+    kept = keep_pictures(pictures, [], min_area_ratio=MIN_AREA_RATIO)
 
-    assert keep_pictures(pictures, min_area_ratio=MIN_AREA_RATIO) == []
+    assert len(kept) == 1
+    assert kept[0].picture.area_ratio == 0.05
+    assert kept[0].group_id is None
 
 
 def test_heading_block_does_not_become_a_fragment() -> None:

@@ -51,12 +51,46 @@ MIN_FRAGMENT_TOKENS: Final = 600
 SCAN_TEXT_THRESHOLD: Final = 100
 """§5.2 п. 2: «менее 100 символов текста при непустом изображении» — скан."""
 
-FIGURE_CAPTION = re.compile(r"^\s*рис\.?\s*(\d+)", re.IGNORECASE)
-"""Подпись пронумерованного набора §5.2 п. 4.
+FIGURE_CAPTION = re.compile(r"рис\.?\s*(\d+)(?!\s*\))", re.IGNORECASE)
+r"""Подпись пронумерованного набора §5.2 п. 4.
 
-Форма «Рис. N» взята из спецификации дословно; точка необязательна, регистр
-не важен. Другие формы подписи (`Фото 1`, `Схема 2`) сюда не попадают
-намеренно: §5.2 называет одну, а догадываться за спецификацию — §40.
+Форма «Рис. N» взята из спецификации; точка необязательна, регистр не важен.
+Другие формы (`Фото 1`, `Схема 2`) сюда не попадают намеренно: §5.2 называет
+одну, а догадываться за спецификацию — §40.
+
+**Поиск по всему блоку, а не с его начала, и с исключением «Рис. N)».** В PR A
+стояло `^рис\.?\s*N` — замер по корпусу 49 файлов показал два дефекта такой
+формы. Ложное срабатывание: блок «рис. 1) женского платья» — обрывок фразы, а
+не подпись, и он единственный давал «подпись на странице без изображений».
+Потеря: блок «грейфера Рис.3. Модель захвата» — настоящая подпись, склеенная
+разбором с концом предыдущей строки, — не опознавалась, и третья картинка
+набора оставалась вне группы (стр. 29 `tasks-tech-11-prak`).
+
+Замер четырёх вариантов (подписей / файлов / ложных / привязанных картинок):
+`^рис N` — 27/11/1/39; `^рис N[.-—:]` — 23/10/0/—; `рис N[.-—:]` где угодно —
+24/10/0/—; **этот вариант вместе с `CAPTION_MAX_CHARS` — 27/10/0/40**. Только
+он не теряет законных подписей вида «Рис. 1» и «Рис. 2 Фронтон Большого
+театра», где после номера нет разделителя.
+
+Следствие формы названо прямо: короткий блок «см. рис. 2 выше» станет
+подписью. От этого защищает только исключение `рис N)`, и на корпусе ложных
+срабатываний не осталось — но правило опознаёт форму, а не смысл.
+"""
+
+CAPTION_MAX_CHARS: Final = 120
+"""Предел длины блока-подписи. §5.2 п. 4 о длине молчит — это замер.
+
+Поиск «Рис. N» по всему блоку без границы длины превращал в подписи абзацы,
+упоминающие рисунок: замер по корпусу — **10** таких блоков, самый длинный
+**2634** символа (`tasks-tech-11-model-kddt-final-24-25.pdf`, стр. 7). Способ
+подсчёта: блоки, которые проходят `FIGURE_CAPTION`, но длиннее этой границы.
+Граница отсекает их все.
+
+Числа замера: самая длинная подпись корпуса — 57 символов («Рис. 1. Виды
+графических элементов для выполнения задания»), медиана 35, подписей 27 в 10
+файлах на 49 файлах корпуса. Предел взят с запасом вдвое от максимума, а не
+вплотную: подпись длиннее 57 символов встретиться может, абзац короче 120 —
+вряд ли.
 """
 
 
@@ -91,9 +125,33 @@ class Picture:
     bbox: tuple[float, float, float, float]
     area_ratio: float
     """Доля площади страницы. Сравнивается с `MIN_IMAGE_AREA_RATIO` (§30.3)."""
-    caption: str | None = None
-    """Текст рядом с изображением, если он найден: по нему работает правило
-    группы §5.2 п. 4."""
+    xref: int = 0
+    """Идентификатор объекта изображения внутри PDF.
+
+    По нему идёт дедупликация: одно и то же изображение размещается в
+    документе многократно — замер по корпусу 49 файлов даёт 86 лишних
+    размещений в 10 файлах, максимум 31 копия (белая подложка страницы, доля
+    площади 0.69). «Та же картинка» по определению PDF — это один `xref`, а не
+    сходство пикселей, поэтому хеш содержимого не нужен: он дал бы тот же
+    ответ дороже.
+    """
+
+
+@dataclass(frozen=True)
+class Caption:
+    """Подпись «Рис. N» на странице. §5.2 п. 4.
+
+    Отдельная структура, а не поле `Picture`: подпись существует до того, как
+    известно, каким изображениям она принадлежит, и одна подпись может
+    принадлежать нескольким сразу — это и есть второй признак набора.
+    Подпись без изображений тоже бывает (замер корпуса: такие есть) и обязана
+    не ломать правило.
+    """
+
+    page: int
+    number: int
+    bbox: tuple[float, float, float, float]
+    text: str
 
 
 @dataclass(frozen=True)
@@ -257,70 +315,159 @@ def glue(
     return pieces
 
 
-def keep_pictures(pictures: Sequence[Picture], *, min_area_ratio: float) -> list[KeptPicture]:
-    """Решает, какие изображения сохранить. §5.2 п. 4.
+def captions_of(blocks: Sequence[Block]) -> list[Caption]:
+    """Подписи «Рис. N» среди текстовых блоков страницы. §5.2 п. 4.
 
-    Правило порога и правило группы действуют вместе:
+    Блок длиннее `CAPTION_MAX_CHARS` подписью не считается: замер в докстроке
+    константы. Номер берётся первым вхождением — «Рис. 1» в блоке, который
+    начинается словами «Рис. 1. Виды…», это и есть номер подписи.
+    """
+    out: list[Caption] = []
+    for block in blocks:
+        text = block.text.strip()
+        if len(text) > CAPTION_MAX_CHARS:
+            continue
+        match = FIGURE_CAPTION.search(text)
+        if match is None:
+            continue
+        out.append(Caption(page=block.page, number=int(match.group(1)), bbox=block.bbox, text=text))
+    return out
+
+
+def assign_captions(
+    pictures: Sequence[Picture], captions: Sequence[Caption]
+) -> dict[int, list[Picture]]:
+    """Какая подпись каким изображениям принадлежит. Ключ — индекс в `captions`.
+
+    Правило выведено замером по корпусу 49 файлов, а не из спецификации: §5.2
+    п. 4 о связи подписи с изображением молчит. Изображение достаётся подписи,
+    которая
+
+    1. пересекается с ним **по горизонтали**;
+    2. начинается **ниже верха** изображения;
+    3. ближайшая по `|подпись.y0 − низ изображения|` **среди подходящих по
+       пунктам 1–2**.
+
+    Пункт 3 сформулирован именно так не из педантизма: прочтение «ближайшая
+    среди всех подписей страницы» даёт 34 привязки вместо 40 и ломает страницу
+    с рядом подписей в три столбца — там изображение уходит к подписи соседней
+    колонки (замер: стр. 27 `tasks-tech-10-prak` даёт `{3: 1}` вместо
+    `{1: 1, 2: 1, 3: 1}`).
+
+    Чего в правиле **нет** — порога расстояния. Первая редакция плана ставила
+    20 pt «под изображением»; замер показал, что это неверно дважды: зазоры по
+    корпусу от −31.5 до +30.2 pt, медиана **−6.3**, то есть в 14 случаях из 26
+    подпись начинается выше низа своей картинки, и порог 20 pt покрыл бы 8 из
+    26. Пункт 2 сравнивает с **верхом** изображения, и порог не нужен.
+
+    Итог замера этим правилом: 27 подписей в 10 файлах, 40 привязанных
+    изображений, ни одной подписи без своих картинок.
+    """
+    out: dict[int, list[Picture]] = {index: [] for index, _ in enumerate(captions)}
+    for picture in pictures:
+        candidates = [
+            (index, caption)
+            for index, caption in enumerate(captions)
+            if caption.page == picture.page
+            and caption.bbox[0] < picture.bbox[2]
+            and caption.bbox[2] > picture.bbox[0]
+            and caption.bbox[1] > picture.bbox[1]
+        ]
+        if not candidates:
+            continue
+        index, _ = min(candidates, key=lambda item: abs(item[1].bbox[1] - picture.bbox[3]))
+        out[index].append(picture)
+    return out
+
+
+def keep_pictures(
+    pictures: Sequence[Picture],
+    captions: Sequence[Caption] = (),
+    *,
+    min_area_ratio: float,
+) -> list[KeptPicture]:
+    """Решает, какие изображения сохранить и что из них набор. §5.2 п. 4.
+
+    Правило порога и правило набора действуют вместе:
 
     - изображение **вне** набора сохраняется, если его площадь больше
       `min_area_ratio` (§30.3, `MIN_IMAGE_AREA_RATIO` = 0.02);
-    - изображения одной страницы с подписями «Рис. N», образующие
-      **непрерывную** нумерацию, сохраняются целиком — независимо от площади
-      каждого — и получают общий `group_id`.
+    - изображения набора сохраняются целиком, независимо от площади каждого, и
+      получают общий `group_id`.
 
-    Непрерывность нумерации и есть признак набора: §5.2 приводит замер, где
-    на странице «Рис. 1…10» восемь картинок из десяти не прошли порог, и
-    разорванный набор бесполезен. Разрыв в номерах начинает новый набор:
-    «Рис. 1, 2, 3» и «Рис. 7, 8» на одной странице — две разные группы, и
-    общий `group_id` у них означал бы, что `match_image` соберёт задание из
-    двух несвязанных иллюстраций.
+    **У набора два признака**, и оба нужны (ТЗ v3.17, решение Архитектора
+    2026-10-15):
+
+    - **ряд подписей** — «Рис. 1», «Рис. 2», «Рис. 3» с непрерывной нумерацией
+      на одной странице; их изображения сливаются в один набор. Замер: 6
+      страниц корпуса;
+    - **гроздь под одной подписью** — у одной подписи несколько своих
+      изображений. Замер по корпусу: **пять** таких подписей, способ подсчёта
+      — подписи, которым `assign_captions` отдал ≥2 изображения. Самая крупная
+      — страница, которую §5.2 приводит собственным примером (десять элементов
+      под подписью «Рис. 1», нумерованных голыми числами); остальные четыре
+      дают по две картинки.
+
+    Одного первого признака недостаточно: он не собирает пример из самого §5.2.
+    Одного второго — тоже: он разваливает шесть страниц корпуса на одиночные
+    наборы. Приоритет между ними не нужен — ряд **сливает** подписи, гроздь
+    берёт свои, и на странице с обеими формами (`tasks-tech-9-tvor`, стр. 2:
+    `{1: 2, 2: 1}`) выходит один набор из трёх изображений.
+
+    Разрыв нумерации начинает новый набор: «Рис. 1, 2, 3» и «Рис. 7, 8» на
+    одной странице — две разные группы, и общий `group_id` означал бы, что
+    `match_image` соберёт задание из двух несвязанных иллюстраций.
     """
-    numbered: dict[int, list[tuple[int, Picture]]] = {}
-    singles: list[Picture] = []
-
-    for picture in pictures:
-        match = FIGURE_CAPTION.match(picture.caption or "")
-        if match is None:
-            singles.append(picture)
-            continue
-        numbered.setdefault(picture.page, []).append((int(match.group(1)), picture))
+    assigned = assign_captions(pictures, captions)
+    owned = {id(picture) for group in assigned.values() for picture in group}
 
     kept: list[KeptPicture] = []
-
-    for page, items in numbered.items():
-        items.sort(key=lambda pair: pair[0])
-        run: list[tuple[int, Picture]] = []
-        for number, picture in items:
-            if run and number != run[-1][0] + 1:
-                kept.extend(_as_group(page, run, min_area_ratio))
-                run = []
-            run.append((number, picture))
-        kept.extend(_as_group(page, run, min_area_ratio))
+    for page_captions in _by_page(captions):
+        for run in _runs(page_captions):
+            members = [picture for index, _ in run for picture in assigned[index]]
+            if not members:
+                continue
+            first = run[0][1]
+            if len(members) == 1:
+                # Набор из одной картинки набором не является: `group_id`
+                # называет набор, и на одиночной подписи он означал бы набор
+                # из одного элемента, который `match_image` собрать не может
+                # (§9.2 требует минимум двух пар).
+                if members[0].area_ratio > min_area_ratio:
+                    kept.append(KeptPicture(picture=members[0], group_id=None))
+                continue
+            group_id = f"page{first.page}-fig{first.number}"
+            kept.extend(KeptPicture(picture=picture, group_id=group_id) for picture in members)
 
     kept.extend(
         KeptPicture(picture=picture, group_id=None)
-        for picture in singles
-        if picture.area_ratio > min_area_ratio
+        for picture in pictures
+        if id(picture) not in owned and picture.area_ratio > min_area_ratio
     )
     return kept
 
 
-def _as_group(
-    page: int, run: Sequence[tuple[int, Picture]], min_area_ratio: float
-) -> list[KeptPicture]:
-    """Один непрерывный набор «Рис. N» или одиночная подписанная картинка.
+def _by_page(captions: Sequence[Caption]) -> list[list[tuple[int, Caption]]]:
+    """Подписи, сгруппированные по странице, с сохранением индексов."""
+    pages: dict[int, list[tuple[int, Caption]]] = {}
+    for index, caption in enumerate(captions):
+        pages.setdefault(caption.page, []).append((index, caption))
+    return list(pages.values())
 
-    Набор из одной картинки группой не является: `group_id` называет набор, и
-    на одиночной подписи он означал бы набор из одного элемента, который
-    `match_image` собрать не может (§9.2 требует минимум двух пар).
+
+def _runs(page_captions: Sequence[tuple[int, Caption]]) -> list[list[tuple[int, Caption]]]:
+    """Непрерывные ряды номеров внутри одной страницы.
+
+    Дубль номера («Рис. 2» дважды на странице) ряд не разрывает и не
+    удваивает: номера берутся по возрастанию, и повтор просто попадает в тот
+    же ряд. На корпусе таких страниц нет ни одной — поведение названо, чтобы
+    не выяснялось на первом же материале, где они появятся.
     """
-    if not run:
-        return []
-    if len(run) == 1:
-        picture = run[0][1]
-        if picture.area_ratio > min_area_ratio:
-            return [KeptPicture(picture=picture, group_id=None)]
-        return []
-
-    group_id = f"page{page}-fig{run[0][0]}"
-    return [KeptPicture(picture=picture, group_id=group_id) for _, picture in run]
+    ordered = sorted(page_captions, key=lambda item: item[1].number)
+    runs: list[list[tuple[int, Caption]]] = []
+    for item in ordered:
+        if runs and item[1].number - runs[-1][-1][1].number <= 1:
+            runs[-1].append(item)
+        else:
+            runs.append([item])
+    return runs

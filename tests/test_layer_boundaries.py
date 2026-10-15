@@ -176,3 +176,33 @@ def test_mypy_relaxation_covers_exactly_one_module() -> None:
 
     assert len(relaxed) == 1, f"послаблений не одно: {relaxed}"
     assert relaxed[0]["module"] == ["core.adapters.pdf"], relaxed[0]["module"]
+
+
+def test_assets_is_optional_in_the_contract() -> None:
+    """§5.1 v3.17: третий метод необязательный — адаптер без медиафайлов цел.
+
+    Проверяется на заглушке, которая `assets` не переопределяет: если метод
+    станет `@abstractmethod`, заглушка перестанет создаваться, и тест
+    покраснеет здесь, а не в шести местах конвейера.
+    """
+    from core.adapters.stub import StubAdapter
+
+    adapter = StubAdapter()
+
+    assert "assets" not in StubAdapter.__dict__, "заглушка переопределила необязательный метод"
+    assert hasattr(adapter, "assets")
+
+
+async def test_default_assets_yields_nothing_and_is_an_iterator() -> None:
+    """Пустая реализация — асинхронный итератор, а не корутина.
+
+    Разница существенна: `async def` без `yield` вернул бы корутину, и
+    `async for` по ней упал бы в стадии, а не здесь.
+    """
+    from core.adapters.base import IngestCtx
+    from core.adapters.stub import StubAdapter
+
+    stream = StubAdapter().assets("/tmp/нет", IngestCtx(material_id=1, tmp_dir="/tmp"))
+
+    assert hasattr(stream, "__anext__"), "метод вернул не асинхронный итератор"
+    assert [item async for item in stream] == []
