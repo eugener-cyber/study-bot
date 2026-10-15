@@ -24,9 +24,11 @@ from tests.conftest import ENV_STUB
 from tests.pdf_fixtures import (
     PAGE_ONE_MARKER,
     PAGE_TWO_MARKER,
+    lying_page_count_pdf,
     mixed_pdf,
     scanned_pdf,
     text_pdf,
+    zero_page_pdf,
 )
 
 A4_HEIGHT_AT_150_DPI = 1755
@@ -350,6 +352,50 @@ async def test_probe_and_extract_refuse_a_file_that_is_not_a_pdf(
         adapter.render_page(str(not_pdf), 1)
     with pytest.raises(NotAPdfError):
         adapter.render_highlighted(str(not_pdf), 1, (0.0, 0.0, 10.0, 10.0))
+
+
+async def test_no_open_failure_leaks_the_library_exception_type(
+    adapter: PdfAdapter, tmp_path: Path
+) -> None:
+    """Ни один отказ открытия не отдаёт тип PyMuPDF. §35, ADR-0007 решение 10.
+
+Пять входов, и до правки по замечанию ревью фазы 2 два из них уезжали
+    наружу типом библиотеки: отсутствующий файл давал
+    `pymupdf.FileNotFoundError` (потомок `RuntimeError`, **не** встроенного), а
+    документ с неверным числом страниц — голый
+    `RuntimeError: code=7: Invalid number of pages`, потому что `pymupdf.open`
+    его проходит и падает уже `page_count`. Пятый вход — корректный PDF без
+    страниц: он открывался молча, и `probe` отдавал `pages = 0`.
+
+    Проверяется **модуль** типа исключения, а не только его имя:
+    `pymupdf.FileNotFoundError` и встроенный `FileNotFoundError` называются
+    одинаково, и ассерт по имени считал бы утечку закрытой.
+    """
+    real = text_pdf(tmp_path / "ok.pdf")
+
+    not_pdf = tmp_path / "notes.md"
+    not_pdf.write_text("Просто текстовый конспект, не PDF.\n", encoding="utf-8")
+    empty = tmp_path / "empty.pdf"
+    empty.write_bytes(b"")
+    missing = tmp_path / "нет-такого.pdf"
+
+    for path, expected in (
+        (not_pdf, NotAPdfError),
+        (empty, NotAPdfError),
+        (lying_page_count_pdf(tmp_path / "lying.pdf"), NotAPdfError),
+        (zero_page_pdf(tmp_path / "zero.pdf"), NotAPdfError),
+        (missing, FileNotFoundError),
+    ):
+        with pytest.raises(expected) as caught:
+            await adapter.probe(str(path))
+        assert not type(caught.value).__module__.startswith("pymupdf"), (
+            f"{path.name}: наружу уехал {type(caught.value).__module__}."
+            f"{type(caught.value).__name__}"
+        )
+
+    # Положительная половина: настоящий PDF по-прежнему читается, то есть
+    # отказы получены не поломкой `_open`.
+    assert (await adapter.probe(str(real))).pages == 2
 
 
 async def test_the_refusal_does_not_leak_the_pymupdf_exception_type(

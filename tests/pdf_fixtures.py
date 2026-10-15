@@ -122,3 +122,41 @@ def mixed_pdf(path: Path) -> Path:
     finally:
         mixed.close()
     return path
+
+
+_MINIMAL_PDF = """%PDF-1.7
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Kids[]/Count {count}>>endobj
+trailer<</Root 1 0 R>>
+%%EOF
+"""
+"""Каркас PDF без страниц, в котором `/Count` задаётся снаружи.
+
+Две поломки из одного шаблона, и обе — не «мусор вместо файла», а правильно
+устроенный документ с неверным числом страниц: такой открывается, а падает
+позже. Этим он и ценен — именно на нём `pymupdf.open` проходит, а
+`document.page_count` поднимает голый `RuntimeError`.
+"""
+
+
+def lying_page_count_pdf(path: Path) -> Path:
+    """PDF, обещающий три страницы при пустом `Kids`.
+
+    Замер: `pymupdf.open` проходит, `document.page_count` поднимает
+    `RuntimeError: code=7: Invalid number of pages` — **без** своего класса у
+    библиотеки. Тот же отказ давал обрезанный настоящий PDF; обрезание
+    синтетической фикстуры его не даёт (PyMuPDF восстанавливает xref
+    маленького файла), поэтому поломка собрана прямо, а не отрезанием.
+    """
+    path.write_text(_MINIMAL_PDF.format(count=3), encoding="ascii")
+    return path
+
+
+def zero_page_pdf(path: Path) -> Path:
+    """Корректный PDF без страниц: открывается, `page_count` равен нулю.
+
+    Извлекать из него нечего, и `probe` без проверки отдал бы `pages = 0`, а
+    материал дошёл бы до `ready` без содержания.
+    """
+    path.write_text(_MINIMAL_PDF.format(count=0), encoding="ascii")
+    return path

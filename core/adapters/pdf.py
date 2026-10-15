@@ -56,11 +56,12 @@ VISION_PENDING_KEY: Final = "vision_pending_pages"
 
 
 class NotAPdfError(Exception):
-    """Файл не PDF, хотя материал помечен типом `pdf`. §5.1.
+    """Файл не читается как PDF, хотя материал помечен типом `pdf`. §5.1.
 
-    Своё исключение, а не `pymupdf.FileDataError`: наружу из единственного
-    модуля с PyMuPDF не должен уезжать тип библиотеки — иначе её пришлось бы
-    импортировать всем, кто хочет этот случай поймать (§35, ADR-0007).
+    Своё исключение, а не тип PyMuPDF: наружу из единственного модуля с
+    библиотекой не должен уезжать её тип — иначе её пришлось бы импортировать
+    всем, кто хочет этот случай поймать, и граница §35 обходилась бы через
+    тип исключения (ADR-0007 решение 10).
     """
 
 
@@ -70,13 +71,56 @@ def _open(path: str) -> pymupdf.Document:
     Без `filetype` PyMuPDF определяет формат по расширению и открывает что
     угодно: замер на обычном `notes.md` — документ из одной «страницы» и 11
     символов текста, без исключения. То есть материал, помеченный `pdf` по
-    ошибке, молча давал один бессмысленный фрагмент вместо отказа. Замечание
-    ревью PR #42.
+    ошибке, молча давал один бессмысленный фрагмент вместо отказа (замечание
+    ревью PR #42, фаза 1).
+
+    Перехват по `RuntimeError`, а не по `pymupdf.FileDataError`: у библиотеки
+    **все** отказы открытия — потомки `RuntimeError`, и часть из них не имеет
+    своего класса вовсе. Замеры (ревью фазы 2 и свои):
+
+    | вход | что поднимает PyMuPDF |
+    |---|---|
+    | `notes.md` | `FileDataError` |
+    | пустой файл | `EmptyFileError` (потомок `FileDataError`) |
+    | обрезанный PDF | **голый** `RuntimeError: code=7: Invalid number of pages` |
+    | отсутствующий файл | `pymupdf.FileNotFoundError` — потомок `RuntimeError`, |
+    | | **а не** встроенного `FileNotFoundError` |
+
+    Поэтому первая редакция ловила два случая из четырёх, а на остальных
+    наружу уезжал тип библиотеки. Отсутствующий файл отдаётся **встроенным**
+    `FileNotFoundError`: это не «файл не того формата», и стандартный тип
+    честнее своего.
+
+    Число страниц читается **здесь же**, и вот почему: на обрезанном PDF
+    `pymupdf.open` проходит, а `document.page_count` поднимает голый
+    `RuntimeError: code=7: Invalid number of pages`. Если бы проверка стояла у
+    вызывающего, тип библиотеки уезжал бы наружу именно на этом входе — то
+    есть обещание держалось бы на трёх случаях из четырёх. Документ без
+    страниц тоже отказ: извлекать из него нечего, а `probe` отдал бы
+    `pages = 0` и материал дошёл бы до `ready` без содержания.
+
+    Граница обещания: утверждение касается **открытия документа**. Сбой при
+    чтении отдельной страницы уже открытого документа поднимается как есть —
+    такой ветви на нашем корпусе не нашлось, и выдумывать для неё перехват
+    значило бы обещать непроверенное.
     """
     try:
-        return pymupdf.open(path, filetype="pdf")
-    except pymupdf.FileDataError as error:
+        document = pymupdf.open(path, filetype="pdf")
+    except pymupdf.FileNotFoundError as error:
+        raise FileNotFoundError(f"файла нет: {path}") from error
+    except RuntimeError as error:
         raise NotAPdfError(f"файл не читается как PDF: {path}") from error
+
+    try:
+        page_count = document.page_count
+    except RuntimeError as error:
+        document.close()
+        raise NotAPdfError(f"число страниц не читается: {path}") from error
+
+    if page_count < 1:
+        document.close()
+        raise NotAPdfError(f"в документе нет страниц: {path}")
+    return document
 
 
 class PdfAdapter(SourceAdapter):
