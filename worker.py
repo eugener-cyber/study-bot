@@ -247,7 +247,7 @@ async def _show_done(ctx: dict[str, Any], material_id: int) -> None:
     text = "✅ Готово. Материал обработан, задания в расписании."
 
     async with session_scope(ctx["sessions"]) as session:
-        origin = (
+        origin: dict[str, Any] | None = (
             await session.execute(select(Material.origin).where(Material.id == material_id))
         ).scalar_one()
     pending = list((origin or {}).get(VISION_PENDING_KEY) or [])
