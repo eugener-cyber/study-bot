@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,7 +37,7 @@ from core.adapters.pdf import VISION_PENDING_KEY
 from core.adapters.stub import StubAdapter
 from core.config import Settings, load_settings
 from core.db.engine import build_engine, build_sessionmaker
-from core.db.models import Fragment, Material, User
+from core.db.models import Fragment, Material, MediaAsset, User
 from core.db.session import session_scope
 from core.ingest import handlers as h
 from core.ingest.pipeline import StageHandler, process_material
@@ -204,6 +205,14 @@ async def dump_material(material_id: int) -> int:
                 return 1
             kind, status, origin = row
 
+            assets = (
+                await session.execute(
+                    select(MediaAsset.id, MediaAsset.path, MediaAsset.caption)
+                    .where(MediaAsset.material_id == material_id)
+                    .order_by(MediaAsset.id)
+                )
+            ).all()
+
             fragments = (
                 await session.execute(
                     select(
@@ -227,12 +236,40 @@ async def dump_material(material_id: int) -> int:
                 f"{', '.join(str(page) for page in pending)}; "
                 "они ждут распознавания и заданий пока не дают"
             )
+        if assets:
+            print(_assets_block(assets, MATERIALS_ROOT))
         print()
         for ord_, frag_kind, locator, quality, tokens, text in fragments:
             print(_fragment_line(ord_, frag_kind, locator or {}, quality, tokens, text))
     finally:
         await engine.dispose()
     return 0
+
+
+def _assets_block(
+    rows: Sequence[tuple[int, str | None, str | None]],
+    root: str,
+) -> str:
+    """Ассеты материала: страница, площадь, подпись, группа и наличие файла.
+
+    Путь в базе хранится **относительно корня хранилища** (решение C1b), и
+    склеивать его нужно здесь, а не в базе: воркер работает в контейнере,
+    харнесс — на хосте. Пометка «файла нет» и есть обнаружение окна §4.2 —
+    строки коммитятся до переноса файлов, и падение процесса между этими
+    шагами оставляет ссылку без файла. §6.3 требует видимых последствий.
+
+    Перечень измерений (страница, доля площади, группа) берётся из
+    `materials.origin`: колонок под них в `media_assets` нет, постоянное место
+    группы — локатор фрагмента (§3.4), и это долг C2 (ADR-0008).
+    """
+    lines = [f"ассетов: {len(rows)}"]
+    for asset_id, path, caption in rows:
+        exists = (Path(root) / path).is_file() if path else False
+        mark = "" if exists else "  ⚠️ файла нет по пути"
+        shown = (caption or "").strip().replace("\n", " ")
+        tail = f" «{shown[:40]}»" if shown else ""
+        lines.append(f"  id={asset_id} {path}{tail}{mark}")
+    return "\n".join(lines)
 
 
 def _fragment_line(
