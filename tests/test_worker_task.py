@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from core.adapters.pdf import VISION_PENDING_KEY, PdfAdapter
 from core.adapters.stub import StubAdapter
 from core.db.models import Material, User
 from core.db.session import session_scope
@@ -28,7 +29,9 @@ pytestmark = pytest.mark.db
 NOW = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
 
 
-async def _material(engine: AsyncEngine, tg_id: int = 1200) -> int:
+async def _material(
+    engine: AsyncEngine, tg_id: int = 1200, origin: dict[str, Any] | None = None
+) -> int:
     async with engine.begin() as connection:
         user_id = (
             await connection.execute(
@@ -45,7 +48,7 @@ async def _material(engine: AsyncEngine, tg_id: int = 1200) -> int:
                         status="processing",
                         mode="full",
                         completed_stages=[],
-                        origin={"path": "/tmp/none.md"},
+                        origin={"path": "/tmp/none.md", **(origin or {})},
                         progress={},
                         created_at=NOW,
                     )
@@ -249,3 +252,124 @@ async def test_progress_message_id_is_none_for_seeded_material(
     material_id = await _material(engine)
     async with session_scope(sessions) as session:
         assert await progress_message_id(session, material_id) is None
+
+
+# --- Выбор адаптера по materials.kind (§3, §5.1) --------------------------
+
+
+def test_adapter_is_picked_by_kind_and_not_by_file_extension() -> None:
+    """§3: тип материала — это `materials.kind`, а не расширение пути.
+
+    Пара проверена накрест: для `kind = "pdf"` путь с расширением `.md`, для
+    `kind = "text"` — путь с `.pdf`. При выборе по пути обе проверки
+    провалились бы, при выборе по типу обе проходят.
+    """
+    import worker
+
+    settings = _settings()
+
+    assert isinstance(worker._adapter_for("pdf", "/tmp/конспект.md", settings), PdfAdapter)
+    assert isinstance(worker._adapter_for("text", "/tmp/lecture.pdf", settings), StubAdapter)
+
+
+async def test_task_refuses_a_kind_whose_adapter_has_not_arrived(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """Тип без адаптера даёт внятный отказ, а не пустую обработку.
+
+    Этот тест и есть доказательство, что тип читается **из базы**: путь файла
+    здесь `/tmp/none.md`, то есть при выборе по расширению материал ушёл бы в
+    текстовую заглушку и дошёл бы до стадий, а по `kind = "image"` фабрика
+    отказывает с именем пакета, в котором адаптер приедет.
+    """
+    import worker
+
+    material_id = await _material(engine, tg_id=1303)
+    async with engine.begin() as connection:
+        await connection.execute(
+            Material.__table__.update().where(Material.id == material_id).values(kind="image")
+        )
+
+    with pytest.raises(ValueError, match="WP-06 PR C"):
+        await worker.process_material_task(_ctx(sessions, tmp_path), material_id, "/tmp/none.md")
+
+    assert (await _status_and_error(engine, material_id))[0] == "failed"
+
+
+# --- Сообщение о готовности называет пропущенные страницы (§6.3) ----------
+
+
+class EditingBot:
+    """Записывает правки текста сообщения прогресса.
+
+    Подставляется в `ctx["bot"]` напрямую: проверяется, что печатает воркер, а
+    не как aiogram доставляет правку.
+    """
+
+    def __init__(self) -> None:
+        self.edited: list[str] = []
+
+    async def edit_message_text(self, *, text: str, chat_id: int, message_id: int) -> None:
+        self.edited.append(text)
+
+
+async def _done_text(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    origin: dict[str, Any] | None,
+    tg_id: int,
+) -> str:
+    import worker
+
+    material_id = await _material(engine, tg_id=tg_id, origin=origin)
+    async with session_scope(sessions) as session:
+        await remember_message(session, material_id, 777)
+
+    bot = EditingBot()
+    ctx = _ctx(sessions, tmp_path) | {"bot": bot}
+    await worker._show_done(ctx, material_id)
+
+    assert bot.edited, "сообщение о готовности не отправлено вовсе"
+    return bot.edited[-1]
+
+
+async def test_done_message_names_the_pages_awaiting_vision(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """§6.3: последствия пропуска страниц видны пользователю, а не только в базе.
+
+    Третье из трёх мест видимости `vision_pending_pages` — сообщение в чате
+    (первые два: `materials.origin` и `make dump-material`). До этого теста
+    ветвь не держалась ничем: живой прогон PR A шёл через `make seed`, где
+    Telegram не участвует, а `worker.py` не входит и в `files` для `mypy`.
+
+    Пара ассертов, а не один: без второго теста — на материале без пропусков —
+    проверка прошла бы и у реализации, которая печатает предупреждение всегда.
+    """
+    with_pending = await _done_text(
+        engine, sessions, tmp_path, {VISION_PENDING_KEY: [1, 3]}, tg_id=1301
+    )
+
+    assert "Готово" in with_pending
+    assert "Страниц без текстового слоя: 2" in with_pending
+    assert "1, 3" in with_pending, "номера пропущенных страниц не названы"
+
+
+async def test_done_message_is_plain_when_nothing_was_skipped(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """Обратное направление: без пропусков предупреждения нет."""
+    plain = await _done_text(engine, sessions, tmp_path, None, tg_id=1302)
+
+    assert "Готово" in plain
+    assert "текстового слоя" not in plain

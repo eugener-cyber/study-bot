@@ -1,11 +1,11 @@
 # Команды харнесса (План реализации §1.4). Всего там восемь целей; существуют
 # check (WP-01), migrate/downgrade/reset (WP-02), seed (WP-03), session и
-# answer (WP-05). Остальным нечем работать: dump-material относится к WP-06,
-# evals к WP-07, cite к WP-11.
+# answer (WP-05), dump-material (WP-06). Остальным нечем работать: evals
+# относится к WP-07, cite к WP-11.
 
 PY := .venv/bin/python
 
-.PHONY: check lint type test install migrate downgrade reset seed session answer
+.PHONY: check lint type test install migrate downgrade reset seed session answer dump-material
 
 install:
 	python3 -m venv .venv
@@ -58,3 +58,9 @@ session:
 #   make answer IDK=1       — «не знаю» (§20): отдельный исход, а не вариант
 answer:
 	$(PY) -m core.harness answer $(if $(OPTION),--option $(OPTION),) $(if $(IDK),--idk,) $(if $(TG_ID),--tg-id $(TG_ID),)
+
+# Фрагменты материала читаемо (§1.4): страница, заголовок, качество, токены.
+#   make dump-material ID=3
+dump-material:
+	@test -n "$(ID)" || (echo "укажите ID=<material_id>"; exit 1)
+	$(PY) -m core.harness dump-material $(ID)

@@ -31,6 +31,7 @@ from core.ingest.budget import (
 )
 from core.ingest.pipeline import AwaitingUser
 from core.logging import get_logger
+from core.services.materials import merge_origin
 
 log = get_logger(__name__)
 
@@ -63,6 +64,11 @@ async def probe_and_gate(
     question: str | None = None
 
     async with session_scope(sessions) as session:
+        # Измерения `probe` уходят в `materials.origin` по контракту §5.1:
+        # число страниц, а для PDF — ещё и страницы, ждущие vision (§5.2 п. 2).
+        # Пишется здесь, потому что это единственное место, где `SourceMeta`
+        # существует: стадии получают уже готовый адаптер и меты не видят.
+        await merge_origin(session, material_id, meta.extra)
         await _save_estimate(session, material_id, estimate)
         if exceeds_threshold(estimate, settings):
             question = gate_question(estimate, meta.pages)

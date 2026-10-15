@@ -30,6 +30,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from bot.handlers.gate import gate_keyboard
 from bot.main import LOCAL_BOT_API
 from bot.progress import stage_text
+from core.adapters.base import SourceAdapter
+from core.adapters.factory import build_adapter
+from core.adapters.pdf import VISION_PENDING_KEY
 from core.adapters.stub import StubAdapter
 from core.config import Settings, load_settings
 from core.db.engine import build_engine, build_sessionmaker
@@ -78,9 +81,20 @@ async def process_material_task(ctx: dict[str, Any], material_id: int, source_pa
     sessions = ctx["sessions"]
     storage: MaterialStorage = ctx["storage"]
 
-    adapter = StubAdapter(fragments=fragments_from_text_or_stub(source_path))
-
     try:
+        # Выбор адаптера — внутри `try`, а не перед ним: по §3 тип материала
+        # лежит в `materials.kind`, и у типа без адаптера фабрика отказывает
+        # (изображения до PR C, аудио и видео до WP-19 и WP-20). Отказ перед
+        # `try` оставлял бы материал в `processing` навсегда — состояния
+        # «обрабатывается, но никто не обрабатывает» §4.1 не предусматривает.
+        async with session_scope(sessions) as session:
+            kind = str(
+                (
+                    await session.execute(select(Material.kind).where(Material.id == material_id))
+                ).scalar_one()
+            )
+        adapter = _adapter_for(kind, source_path, settings)
+
         # Гейт бюджета — ДО конвейера, а не внутри. §6.3: для сканированного
         # PDF `extract` это vision-вызов на каждую страницу, и гейт после него
         # спрашивал бы «обрабатывать?» после того, как деньги потрачены.
@@ -147,6 +161,24 @@ async def process_material_task(ctx: dict[str, Any], material_id: int, source_pa
     return "ready"
 
 
+def _adapter_for(kind: str, source_path: str, settings: Settings) -> SourceAdapter:
+    """Адаптер по `materials.kind`. §5.1, одна точка выбора — фабрика.
+
+    Тип берётся из базы, а не выводится из пути заново: по §3 тип материала —
+    это `materials.kind`, он записан при приёме, и второй вывод по имени файла
+    расходился с ним на фотографиях (замечание ревью PR #42). Путь к файлу
+    нужен здесь только текстовой заглушке.
+
+    Заглушка остаётся для текстовых материалов: §5 адаптера для них не
+    предусматривает, а конспекты, подготовленные вручную для провайдера
+    `manual` (§2.1, CR-H), прогоняются именно так.
+    """
+    built = build_adapter(kind, settings=settings)
+    if built is not None:
+        return built
+    return StubAdapter(fragments=fragments_from_text_or_stub(source_path))
+
+
 def fragments_from_text_or_stub(source_path: str) -> list[Any]:
     """Фрагменты из файла, если он текстовый, иначе заглушка.
 
@@ -205,7 +237,28 @@ async def _show_stage(ctx: dict[str, Any], material_id: int, stage: str) -> None
 
 
 async def _show_done(ctx: dict[str, Any], material_id: int) -> None:
-    await _edit_progress(ctx, material_id, "✅ Готово. Материал обработан, задания в расписании.")
+    """Сообщение о готовности. При пропущенных страницах — с их числом.
+
+    §6.3: «пользователь не может понять, что у него на руках» — то, чего
+    требование избегает. До PR B пакета WP-06 страницы-сканы пропускаются, и
+    молчаливое «Готово» означало бы материал неизвестного состава. Число
+    берётся из `materials.origin`, куда его положил `probe` (§5.1).
+    """
+    text = "✅ Готово. Материал обработан, задания в расписании."
+
+    async with session_scope(ctx["sessions"]) as session:
+        origin: dict[str, Any] | None = (
+            await session.execute(select(Material.origin).where(Material.id == material_id))
+        ).scalar_one()
+    pending = list((origin or {}).get(VISION_PENDING_KEY) or [])
+    if pending:
+        text = (
+            f"{text}\n\n⚠️ Страниц без текстового слоя: {len(pending)} "
+            f"({', '.join(str(page) for page in pending[:10])}). "
+            "Они пока не распознаны — задания по ним не созданы."
+        )
+
+    await _edit_progress(ctx, material_id, text)
 
 
 async def _show_failed(ctx: dict[str, Any], material_id: int) -> None:

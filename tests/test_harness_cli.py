@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 
 import pytest
 from sqlalchemy import func, select, text
@@ -227,3 +228,102 @@ def test_repeated_session_does_not_count_a_second_show(
     assert "задание 1 из 3" in second
 
     assert asyncio.run(_total_shown()) == 1, "повторный показ вырос в счётчике"
+
+
+async def _material_with_pdf_fragments(pending: list[int] | None = None) -> int:
+    """Материал типа `pdf` с фрагментами и, если нужно, пропущенными страницами."""
+    engine = build_engine(_test_url())
+    try:
+        names = ", ".join(f'"{name}"' for name in Base.metadata.tables)
+        async with engine.begin() as connection:
+            await connection.execute(text(f"TRUNCATE {names} RESTART IDENTITY CASCADE"))
+        base = await scaffold(engine, tg_id=TG_ID)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE materials SET kind='pdf', origin=CAST(:origin AS jsonb) WHERE id=:id"),
+                {
+                    "origin": json.dumps(
+                        {"sha256": "abc", "pages": 3, "vision_pending_pages": pending or []}
+                    ),
+                    "id": base.material_id,
+                },
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO fragments (material_id, ord, kind, locator, text, quality, tokens)"
+                    " VALUES (:m, 2, 'text', CAST(:loc AS jsonb), :t, 1.0, 42)"
+                ),
+                {
+                    "m": base.material_id,
+                    "loc": json.dumps(
+                        {
+                            "type": "pdf",
+                            "page": 2,
+                            "bbox": [72, 100, 523, 200],
+                            "heading": "Раскрой",
+                        }
+                    ),
+                    "t": "Мел размечает ткань по лицевой стороне.",
+                },
+            )
+        return base.material_id
+    finally:
+        await engine.dispose()
+
+
+def test_dump_material_shows_page_heading_and_quality(
+    _database: None,
+    cli: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Критерий WP-06: `make dump-material` показывает результат читаемо.
+
+    Проверяется через `main` с подменённым `argv` — то есть ровно то, что
+    увидит человек, включая код возврата.
+    """
+    material_id = asyncio.run(_material_with_pdf_fragments())
+
+    code = _run(monkeypatch, "dump-material", str(material_id))
+    printed = capsys.readouterr().out
+
+    assert code == 0
+    assert f"материал {material_id}: тип=pdf" in printed
+    assert "стр. 2" in printed
+    assert "[Раскрой]" in printed
+    assert "q=1.0" in printed
+    assert "Мел размечает ткань" in printed
+
+
+def test_dump_material_names_pages_awaiting_vision(
+    _database: None,
+    cli: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """§6.3: последствия обязаны быть видимыми, а не выводимыми.
+
+    До PR B пакета страницы-сканы пропускаются. Молчаливый вывод означал бы
+    материал неизвестного состава: человек видит фрагменты и не знает, что
+    третья страница в них не попала.
+    """
+    material_id = asyncio.run(_material_with_pdf_fragments(pending=[1, 3]))
+
+    code = _run(monkeypatch, "dump-material", str(material_id))
+    printed = capsys.readouterr().out
+
+    assert code == 0
+    assert "страниц без текстового слоя: 2" in printed
+    assert "1, 3" in printed
+
+
+def test_dump_material_of_a_missing_material_says_so(
+    _database: None,
+    cli: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = _run(monkeypatch, "dump-material", "999999")
+
+    assert code == 1
+    assert "нет" in capsys.readouterr().out

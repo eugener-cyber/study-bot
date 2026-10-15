@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 LLM = ROOT / "core" / "llm"
 LEARNING = ROOT / "core" / "learning"
+CORE = ROOT / "core"
 HANDLERS = ROOT / "core" / "ingest" / "handlers.py"
 
 
@@ -130,3 +131,48 @@ def test_planner_uses_the_teachable_wrapper_not_the_sql_function() -> None:
     """
     imported = _imports(LEARNING / "planner.py")
     assert "core.db.teachable" in imported, "планировщик не берёт предикат §14.3 из обёртки"
+
+
+def test_pymupdf_lives_in_one_module() -> None:
+    """PyMuPDF разрешён ровно в `core/adapters/pdf.py`. ТЗ §35 (v3.15).
+
+    §35 даёт послабление `disallow_untyped_calls = false` этому модулю
+    **«для него одного»** и требует теста против расползания — вот он.
+    Второй модуль с этим импортом либо потребует второго послабления, либо
+    упрётся в `--strict`, и оба исхода обнаружатся здесь, а не в споре о том,
+    что имелось в виду.
+
+    Замер, по которому принято решение: пробный файл из 18 строк даёт 4 ошибки
+    `--strict`; модуль рендера того же вида — ещё 3 (`pymupdf.Rect` и
+    `Pixmap.tobytes`). Поэтому рендер и подсветка — методы `PdfAdapter`, а не
+    отдельный модуль.
+    """
+    allowed = CORE / "adapters" / "pdf.py"
+    offending: list[str] = []
+    for module in sorted(CORE.rglob("*.py")):
+        if module == allowed:
+            continue
+        if any(name == "pymupdf" or name.startswith("pymupdf.") for name in _imports(module)):
+            offending.append(str(module.relative_to(ROOT)))
+
+    assert not offending, f"PyMuPDF вышел за границу послабления §35: {offending}"
+
+
+def test_mypy_relaxation_covers_exactly_one_module() -> None:
+    """Послабление в `pyproject.toml` объявлено ровно для одного модуля.
+
+    Проверяется сам конфиг, а не только импорты: расползание бывает двух
+    видов — новый модуль с библиотекой и новая строка в списке `module`.
+    Первое держит тест выше, второе — этот.
+    """
+    import tomllib
+
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    relaxed = [
+        override
+        for override in config["tool"]["mypy"]["overrides"]
+        if override.get("disallow_untyped_calls") is False
+    ]
+
+    assert len(relaxed) == 1, f"послаблений не одно: {relaxed}"
+    assert relaxed[0]["module"] == ["core.adapters.pdf"], relaxed[0]["module"]
