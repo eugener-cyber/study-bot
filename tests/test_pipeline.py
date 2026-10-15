@@ -344,6 +344,7 @@ async def test_run_stage_directly_skips_completed_stage(
             tmp_dir=tmp_dir,
             adapter=_adapter(),
             source_path="stub://source",
+            permanent_dir=storage.permanent_dir(material_id),
         )
 
     result = await run_stage(sessions, storage, counting, EXTRACT, ctx_factory, material_id)

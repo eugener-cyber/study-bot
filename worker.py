@@ -42,6 +42,7 @@ from core.harness import fragments_from_text
 from core.ingest import handlers as h
 from core.ingest.awaiting import expire_stale, progress_message_id
 from core.ingest.gate import probe_and_gate, reestimate_after_extract
+from core.ingest.handlers import ASSETS_ORIGIN_KEY
 from core.ingest.pipeline import AwaitingUser, StageHandler, process_material
 from core.ingest.stages import EXTRACT
 from core.llm.factory import build_client
@@ -256,6 +257,16 @@ async def _show_done(ctx: dict[str, Any], material_id: int) -> None:
             f"{text}\n\n⚠️ Страниц без текстового слоя: {len(pending)} "
             f"({', '.join(str(page) for page in pending[:10])}). "
             "Они пока не распознаны — задания по ним не созданы."
+        )
+
+    assets = list(((origin or {}).get(ASSETS_ORIGIN_KEY) or {}).get("items") or [])
+    if assets:
+        groups = len({item.get("group_id") for item in assets if item.get("group_id")})
+        detail = f", наборов: {groups}" if groups else ""
+        text = (
+            f"{text}\n\n🖼 Изображений сохранено: {len(assets)}{detail}. "
+            "Описания появятся, когда подключится распознавание — "
+            "задания по ним пока не создаются."
         )
 
     await _edit_progress(ctx, material_id, text)

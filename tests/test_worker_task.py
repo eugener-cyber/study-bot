@@ -21,6 +21,7 @@ from core.adapters.stub import StubAdapter
 from core.db.models import Material, User
 from core.db.session import session_scope
 from core.ingest.awaiting import is_awaiting, park, progress_message_id, remember_message, resume
+from core.ingest.handlers import ASSETS_ORIGIN_KEY
 from core.storage import MaterialStorage
 from tests.test_dispatcher import _settings
 
@@ -360,6 +361,55 @@ async def test_done_message_names_the_pages_awaiting_vision(
     assert "Готово" in with_pending
     assert "Страниц без текстового слоя: 2" in with_pending
     assert "1, 3" in with_pending, "номера пропущенных страниц не названы"
+
+
+async def test_done_message_names_saved_images(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """§6.3: сохранённые изображения названы, пока описаний у них нет.
+
+    До C2 ассет существует без описания, то есть без фрагмента: человеку
+    нужно видеть, что картинки сохранены, но заданий по ним ещё не будет.
+    Число наборов называется отдельно — набор это единица, которую потребляет
+    `match_image` (§9.2).
+    """
+    text = await _done_text(
+        engine,
+        sessions,
+        tmp_path,
+        {
+            ASSETS_ORIGIN_KEY: {
+                "items": [
+                    {"asset_id": 1, "page": 10, "group_id": "page10-fig1"},
+                    {"asset_id": 2, "page": 10, "group_id": "page10-fig1"},
+                    {"asset_id": 3, "page": 3, "group_id": None},
+                ]
+            }
+        },
+        tg_id=1304,
+    )
+
+    assert "Изображений сохранено: 3" in text
+    assert "наборов: 1" in text
+
+
+async def test_done_message_says_nothing_about_images_when_there_are_none(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """Обратное направление: без ассетов про изображения не говорится.
+
+    Иначе предыдущий тест прошёл бы и у реализации, которая печатает строку
+    всегда — с нулём.
+    """
+    text = await _done_text(engine, sessions, tmp_path, None, tg_id=1305)
+
+    assert "Изображений" not in text
 
 
 async def test_done_message_is_plain_when_nothing_was_skipped(

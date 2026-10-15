@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select, text
 
+from core import harness
 from core.config import Settings
 from core.db.engine import build_engine
 from core.db.models import Base, Question
@@ -271,6 +273,56 @@ async def _material_with_pdf_fragments(pending: list[int] | None = None) -> int:
         await engine.dispose()
 
 
+async def _material_with_asset(
+    *, path_in_db: str, measurement: dict[str, object] | None = None
+) -> int:
+    """Материал с одной строкой `media_assets` и заданным путём в ней.
+
+    `measurement` — запись перечня `origin.assets.items` для этого ассета:
+    страница, доля площади, подпись, группа. Без неё перечня нет вовсе, и
+    `dump-material` обязан это показать, а не промолчать.
+    """
+    engine = build_engine(_test_url())
+    try:
+        names = ", ".join(f'"{name}"' for name in Base.metadata.tables)
+        async with engine.begin() as connection:
+            await connection.execute(text(f"TRUNCATE {names} RESTART IDENTITY CASCADE"))
+        base = await scaffold(engine, tg_id=TG_ID)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE materials SET kind='pdf' WHERE id=:id"),
+                {"id": base.material_id},
+            )
+            asset_id = (
+                await connection.execute(
+                    text(
+                        "INSERT INTO media_assets (material_id, path, mime, w, h, caption)"
+                        " VALUES (:m, :p, 'image/png', 10, 20, :c) RETURNING id"
+                    ),
+                    {"m": base.material_id, "p": path_in_db, "c": "Рис. 1. Подпись"},
+                )
+            ).scalar_one()
+            if measurement is not None:
+                await connection.execute(
+                    text(
+                        # COALESCE обязателен: у `scaffold` origin пуст, а в Postgres
+                        # `NULL || jsonb` даёт NULL — измерение не записалось бы молча.
+                        "UPDATE materials SET origin ="
+                        " COALESCE(origin, '{}'::jsonb) || CAST(:extra AS jsonb)"
+                        " WHERE id=:id"
+                    ),
+                    {
+                        "extra": json.dumps(
+                            {"assets": {"items": [{"asset_id": asset_id, **measurement}]}}
+                        ),
+                        "id": base.material_id,
+                    },
+                )
+        return int(base.material_id)
+    finally:
+        await engine.dispose()
+
+
 def test_dump_material_shows_page_heading_and_quality(
     _database: None,
     cli: None,
@@ -315,6 +367,121 @@ def test_dump_material_names_pages_awaiting_vision(
     assert code == 0
     assert "страниц без текстового слоя: 2" in printed
     assert "1, 3" in printed
+
+
+def test_dump_material_prints_page_area_and_group(
+    _database: None,
+    cli: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Критерий пакета: набор виден в выводе, а не только число ассетов.
+
+    Измерения (страница, доля площади, группа) лежат в `materials.origin` —
+    колонок под них в `media_assets` нет. Первая редакция `_assets_block` их
+    **не читала**, хотя докстрока утверждала обратное, и приёмка «группа из
+    десяти на стр. 10 видна в `dump-material`» не выполнялась: тесты
+    проверяли только число ассетов и пометку о файле. Нашло ревью PR #53.
+    """
+    material_id = asyncio.run(
+        _material_with_asset(
+            path_in_db="7/assets/img001.png",
+            measurement={
+                "page": 10,
+                "area_ratio": 0.0295,
+                "caption": "Рис. 1. Виды",
+                "group_id": "page10-fig1",
+            },
+        )
+    )
+
+    code = _run(monkeypatch, "dump-material", str(material_id))
+    printed = capsys.readouterr().out
+
+    assert code == 0
+    assert "стр. 10" in printed, "страница не напечатана"
+    assert "0.0295" in printed, "доля площади не напечатана"
+    assert "[page10-fig1]" in printed, "группа не напечатана"
+
+
+def test_dump_material_shows_an_asset_missing_from_origin(
+    _database: None,
+    cli: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Расхождение между таблицей и `origin` видно, а не проглочено.
+
+    Строка `media_assets` без записи в перечне — это рассогласование, и ему
+    место в выводе: «стр. —». Отрицательная половина к тесту выше.
+    """
+    material_id = asyncio.run(_material_with_asset(path_in_db="7/assets/img001.png"))
+
+    code = _run(monkeypatch, "dump-material", str(material_id))
+    printed = capsys.readouterr().out
+
+    assert code == 0
+    assert "стр. —" in printed
+
+
+def test_dump_material_marks_an_asset_whose_file_is_absent(
+    _database: None,
+    cli: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Пометка «файла нет по пути» — обнаружение окна §4.2.
+
+    Строки `media_assets` коммитятся до переноса файлов, и падение процесса
+    между этими шагами оставляет ссылку без файла. Порядок общий для всех
+    стадий с артефактами, менять его ради одного случая нельзя — поэтому
+    последствие показывается.
+
+    Прогон идёт **из другого рабочего каталога** (`monkeypatch.chdir`): путь в
+    базе относителен корня хранилища, и в своём каталоге он совпал бы с
+    рабочим случайно, а проверка ничего бы не значила.
+    """
+    material_id = asyncio.run(_material_with_asset(path_in_db="999/assets/нет.png"))
+
+    monkeypatch.chdir(tmp_path)
+    code = _run(monkeypatch, "dump-material", str(material_id))
+    printed = capsys.readouterr().out
+
+    assert code == 0
+    assert "ассетов: 1" in printed
+    assert "файла нет по пути" in printed
+
+
+def test_dump_material_does_not_mark_an_asset_that_exists(
+    _database: None,
+    cli: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Обратное направление: у существующего файла пометки нет.
+
+    Иначе предыдущий тест прошёл бы и у реализации, которая печатает пометку
+    всегда. Файл создаётся по тому же относительному пути от корня
+    хранилища, что лежит в базе, — то есть проверяется склейка, а не строка.
+    """
+    relative = "7/assets/img001.png"
+    material_id = asyncio.run(_material_with_asset(path_in_db=relative))
+
+    root = tmp_path / "materials"
+    target = root / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(harness, "MATERIALS_ROOT", str(root))
+    code = _run(monkeypatch, "dump-material", str(material_id))
+    printed = capsys.readouterr().out
+
+    assert code == 0
+    assert "ассетов: 1" in printed
+    assert "файла нет по пути" not in printed
 
 
 def test_dump_material_of_a_missing_material_says_so(

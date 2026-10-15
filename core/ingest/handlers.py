@@ -21,6 +21,8 @@ import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, Final
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -28,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.adapters.base import IngestCtx
 from core.config import Settings
-from core.db.models import Fact, Fragment, Question, ReviewState, Section
+from core.db.models import Fact, Fragment, Material, MediaAsset, Question, ReviewState, Section
 from core.db.teachable import generatable_facts_select, teachable_facts_select
 from core.ingest.pipeline import StageContext, StageHandler
 from core.llm.client import LLMClient
@@ -41,6 +43,7 @@ from core.llm.schemas import (
     SectionsAnswer,
 )
 from core.logging import get_logger
+from core.services.materials import merge_origin
 
 log = get_logger(__name__)
 
@@ -61,7 +64,13 @@ async def extract(session: AsyncSession, material: object, ctx: StageContext) ->
         if not fragment.locator:
             raise ValueError(f"фрагмент {fragment.ord} без локатора — нарушение §3")
 
+    # Порядок удаления обязателен по схеме: `fragments.asset_id` ссылается на
+    # `media_assets.id` (ограничение `fragments_asset_id_fkey`), и удаление
+    # ассетов раньше фрагментов нарушило бы его на строках со ссылкой. В C1b
+    # ссылок нет — `asset_id` не заполняется, фрагментов-изображений в пакете
+    # не создаётся, — но порядок задан ограничением, а не состоянием данных.
     await session.execute(delete(Fragment).where(Fragment.material_id == ctx.material_id))
+    await session.execute(delete(MediaAsset).where(MediaAsset.material_id == ctx.material_id))
     session.add_all(
         [
             Fragment(
@@ -79,10 +88,100 @@ async def extract(session: AsyncSession, material: object, ctx: StageContext) ->
     await session.flush()
     log.info("fragments_extracted", material_id=ctx.material_id, count=len(collected))
 
+    await _store_assets(session, ctx)
 
-def _ingest_ctx(ctx: StageContext) -> IngestCtx:
-    """Контекст для адаптера: он не должен знать про стадии и сессии."""
-    return IngestCtx(material_id=ctx.material_id, tmp_dir=str(ctx.tmp_dir))
+
+ASSETS_DIRNAME: Final = "assets"
+"""Подкаталог для файлов ассетов — внутри временной директории стадии и внутри
+постоянного каталога материала.
+
+Не косметика, а механизм идемпотентности §4.3: `storage.commit_tmp` удаляет
+существующую цель перед переносом, и если целью оказывается **каталог**, он
+удаляется целиком. Поэтому повторный запуск стадии заменяет `assets/` со всем
+содержимым, и файлы, которых больше нет среди ассетов, исчезают сами — без
+канала «стадия → конвейер» и без правки §4.2.
+
+Каталог создаётся **всегда**, даже когда ассетов ноль: иначе повторный запуск
+с нулём ассетов не очистил бы прежний каталог. Проверено на настоящем
+`MaterialStorage`: 3 файла → 1 файл → пусто.
+"""
+
+ASSETS_ORIGIN_KEY: Final = "assets"
+"""Ключ `materials.origin` с перечнем ассетов. §6.3.
+
+Страница, доля площади, подпись и группа базе колонками не нужны — постоянное
+место группы это локатор фрагмента (§3.4), а фрагменты-изображения приедут в
+C2. До тех пор перечень живёт здесь, и это **долг с владельцем**: C2 переносит
+группу в локатор и чистит ключ (ADR-0008).
+"""
+
+
+async def _store_assets(session: AsyncSession, ctx: StageContext) -> None:
+    """Пишет файлы ассетов и строки `media_assets`. §5.2 п. 4, §4.2.
+
+    Путь в базе — **относительно корня хранилища**: `<material_id>/assets/имя`.
+    Ни абсолютный, ни относительный к рабочему каталогу: воркер работает в
+    контейнере с `WORKDIR /app`, харнесс — в каталоге разработчика, и оба
+    склеивают это значение со своим `MATERIALS_ROOT`. Абсолютный путь,
+    записанный в контейнере, на хосте не существует (решение плана C1b, запись
+    в ADR-0008; та же болезнь уже есть у `origin.path` — Issue #52).
+    """
+    assets_dir = ctx.tmp_dir / ASSETS_DIRNAME
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    items: list[dict[str, Any]] = []
+    async for asset in ctx.adapter.assets(ctx.source_path, _ingest_ctx(ctx, assets_dir)):
+        name = Path(asset.path).name
+        row = MediaAsset(
+            material_id=ctx.material_id,
+            path=f"{ctx.material_id}/{ASSETS_DIRNAME}/{name}",
+            mime=asset.mime,
+            w=asset.width,
+            h=asset.height,
+            caption=asset.caption,
+        )
+        session.add(row)
+        await session.flush()
+        items.append(
+            {
+                "asset_id": row.id,
+                "page": asset.page,
+                "area_ratio": asset.area_ratio,
+                "caption": asset.caption,
+                "group_id": asset.group_id,
+            }
+        )
+
+    # Ключ пишется, когда ассеты есть, **или** когда он уже есть в `origin`:
+    # второе нужно, чтобы повторный запуск с меньшим числом ассетов заменял
+    # перечень, а не оставлял прежний. Текстовому материалу, у которого
+    # изображений не будет никогда, ключ не ставится вовсе — иначе `origin`
+    # обрастает пустыми структурами у каждого конспекта.
+    existing: dict[str, Any] | None = (
+        await session.execute(select(Material.origin).where(Material.id == ctx.material_id))
+    ).scalar_one()
+    if items or ASSETS_ORIGIN_KEY in (existing or {}):
+        await merge_origin(session, ctx.material_id, {ASSETS_ORIGIN_KEY: {"items": items}})
+
+    log.info(
+        "assets_stored",
+        material_id=ctx.material_id,
+        count=len(items),
+        groups=len({item["group_id"] for item in items if item["group_id"]}),
+    )
+
+
+def _ingest_ctx(ctx: StageContext, tmp_dir: Path | None = None) -> IngestCtx:
+    """Контекст для адаптера: он не должен знать про стадии и сессии.
+
+    `tmp_dir` переопределяется для ассетов: они пишутся в подкаталог
+    `assets/`, чтобы повторный запуск заменял его целиком (см.
+    `ASSETS_DIRNAME`). Фрагментам подкаталог не нужен — они не файлы.
+    """
+    return IngestCtx(
+        material_id=ctx.material_id,
+        tmp_dir=str(tmp_dir if tmp_dir is not None else ctx.tmp_dir),
+    )
 
 
 # ------------------------------------------------------------ содержательные
