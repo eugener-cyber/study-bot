@@ -454,8 +454,8 @@ def test_unknown_extension_is_text_for_the_harness_and_none_for_the_chat() -> No
     """Одна карта, две политики на неизвестном расширении — и обе названы.
 
     `make seed` читает как текст что угодно: это его назначение. Приём файла
-    из чата обязан отказать внятно (§19.4), иначе `.docx` молча стал бы
-    текстовым материалом.
+    из чата обязан отказать внятно (`UNSUPPORTED_KIND`, §26), иначе `.docx`
+    молча стал бы текстовым материалом.
     """
     assert kind_for_path("report.docx") == "text"
     assert known_kind_for_path("report.docx") is None
