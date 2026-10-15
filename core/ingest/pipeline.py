@@ -80,6 +80,18 @@ class StageContext:
     tmp_dir: Path
     adapter: SourceAdapter
     source_path: str
+    permanent_dir: Path
+    """Куда конвейер перенесёт артефакты стадии после коммита (§4.2).
+
+    Нужен стадии, которая пишет **пути** в базу: строка `media_assets` должна
+    указывать на постоянное место, а не на временное. Арифметика от `tmp_dir`
+    («подняться на два уровня и войти в каталог материала») дала бы тот же
+    путь и была бы костылём п. 7 — знанием о чужой раскладке, повторённым во
+    второй раз.
+
+    Поле узкое, а не `MaterialStorage` целиком: стадии незачем видеть
+    `commit_tmp` и `discard_tmp` — перенос и уборка принадлежат конвейеру.
+    """
 
 
 class StageHandler(Protocol):
@@ -219,6 +231,7 @@ async def process_material(
                 tmp_dir=tmp_dir,
                 adapter=adapter,
                 source_path=source_path,
+                permanent_dir=storage.permanent_dir(material_id),
             )
 
         await run_stage(sessions, storage, handler, stage, make_ctx, material_id)

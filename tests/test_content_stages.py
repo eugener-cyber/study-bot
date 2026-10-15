@@ -115,6 +115,7 @@ async def _run_stages(
             tmp_dir=storage.prepare_tmp(material_id, stage),
             adapter=adapter,
             source_path="/tmp/none.md",
+            permanent_dir=storage.permanent_dir(material_id),
         )
         async with session_scope(sessions) as session:
             material = (
