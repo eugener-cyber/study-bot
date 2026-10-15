@@ -393,20 +393,39 @@ def test_a_row_of_captions_in_columns_is_one_set() -> None:
 def test_nearest_caption_is_chosen_among_candidates_not_globally() -> None:
     """Пункт 3 правила: ближайшая **среди подходящих по пунктам 1–2**.
 
-    Прочтение «ближайшая среди всех подписей страницы» даёт по корпусу 34
-    привязки вместо 40 и ломает ряд в столбцах: картинка уходит к подписи
-    соседней колонки. Здесь это закреплено на двух столбцах — у каждой
-    картинки своя подпись, хотя чужая подпись ближе по вертикали.
+    Координаты — замер стр. 27 `tasks-tech-10-prak-kddt-final-21-22.pdf`, и
+    взяты они именно оттуда не для красоты: на этой геометрии глобальное
+    прочтение правила даёт `{3: 3}` — все три картинки уходят к третьей
+    подписи, потому что она ближе по вертикали к низу каждой. Первая редакция
+    теста стояла на выдуманных координатах, где своя подпись была ближайшей и
+    при глобальном прочтении, то есть тест проходил **и при сломанном
+    правиле**; нашло ревью PR #47 мутацией реализации.
+
+    Числа: подписи `Рис.1` y0=384.2, `Рис.2` y0=385.0, `Рис.3` y0=391.0;
+    картинки с низом 388.9, 394.9 и 398.9. Правильное прочтение даёт каждой
+    картинке свою подпись — различает их **горизонталь**, а не вертикаль.
     """
-    left = _pic(5, x0=60.0, y=100.0, width=100.0, height=200.0)
-    right = _pic(5, x0=300.0, y=100.0, width=100.0, height=120.0)
-    near_right = _cap(5, 2, x0=300.0, y=230.0, width=100.0)
-    far_left = _cap(5, 1, x0=60.0, y=310.0, width=100.0)
+    pictures = [
+        Picture(page=27, bbox=(71.0, 271.1, 188.8, 388.9), area_ratio=0.0277, xref=1),
+        Picture(page=27, bbox=(200.4, 271.1, 338.1, 394.9), area_ratio=0.0340, xref=2),
+        Picture(page=27, bbox=(347.2, 282.6, 555.3, 398.9), area_ratio=0.0483, xref=3),
+    ]
+    captions = [
+        Caption(page=27, number=1, bbox=(72.7, 384.2, 192.5, 398.2), text="Рис.1. Захват двух"),
+        Caption(page=27, number=2, bbox=(212.7, 385.0, 341.5, 399.0), text="Рис.2. Захват с двумя"),
+        Caption(page=27, number=3, bbox=(357.1, 391.0, 558.8, 405.0), text="Рис.3. Модель захвата"),
+    ]
 
-    assigned = assign_captions([left, right], [far_left, near_right])
+    assigned = assign_captions(pictures, captions)
 
-    assert assigned[0] == [left], "левая картинка ушла к подписи соседней колонки"
-    assert assigned[1] == [right]
+    assert {index: len(group) for index, group in assigned.items()} == {
+        0: 1,
+        1: 1,
+        2: 1,
+    }, "картинки ушли к чужой подписи — правило прочитано как «глобально ближайшая»"
+    assert assigned[0] == [pictures[0]]
+    assert assigned[1] == [pictures[1]]
+    assert assigned[2] == [pictures[2]]
 
 
 def test_a_picture_below_its_caption_is_not_attached() -> None:
@@ -464,6 +483,27 @@ def test_numbered_set_survives_below_the_threshold() -> None:
 
     assert len(kept) == 3, "набор разорван порогом площади"
     assert {item.group_id for item in kept} == {"page7-fig1"}
+
+
+def test_a_cluster_below_the_threshold_survives_whole() -> None:
+    """Гроздь под одной подписью освобождена от порога §30.3, как и ряд.
+
+    План обещал этот тест отдельно от ряда подписей, и не зря: прежняя
+    проверка «набор ниже порога» стояла на **ряде** из трёх подписей, то есть
+    второй признак набора порогом не проверялся вовсе. Мутация «порог
+    применяется к грозди» не роняла ни одного теста — нашло ревью PR #47.
+
+    Девять картинок по 0.01 под одной подписью: без правила их отбросил бы
+    порог 0.02 целиком, и `match_image` остался бы без материала — ровно то,
+    против чего §5.2 п. 4 и вводился.
+    """
+    pictures = [_pic(6, 0.01, x0=60.0 + index * 50.0, y=100.0) for index in range(9)]
+    captions = [_cap(6, 1, x0=60.0, y=210.0, width=500.0)]
+
+    kept = keep_pictures(pictures, captions, min_area_ratio=MIN_AREA_RATIO)
+
+    assert len(kept) == 9, "гроздь ниже порога отброшена"
+    assert {item.group_id for item in kept} == {"page6-fig1"}
 
 
 def test_a_gap_in_numbering_starts_a_second_group() -> None:
