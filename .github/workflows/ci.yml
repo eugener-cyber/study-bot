@@ -43,8 +43,10 @@ jobs:
       # тест пропускался бы, то есть проверка правила §5.2 п. 4 на настоящем
       # разборе PDF не выполнялась бы в CI вовсе — и пропуск выглядел бы
       # зелёным прогоном.
+      # `update` перед `install`: без него шаг падает на устаревшем индексе
+      # раннера — замечание ревью PR #48.
       - name: Установить шрифт с кириллицей
-        run: sudo apt-get install -y --no-install-recommends fonts-dejavu-core
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends fonts-dejavu-core
 
       - name: Установить зависимости
         run: |
