@@ -296,10 +296,13 @@ async def test_material_without_images_gets_no_rows_and_no_origin_key(
     clean_tables: None,
     tmp_path: Path,
 ) -> None:
-    """Текстовый материал не обрастает пустыми структурами.
+    """Текстовый материал не получает ни строк, ни ключа в `origin`.
 
-    Отрицательная половина: иначе проверки выше прошли бы и у реализации,
-    которая пишет ключ и каталог всегда.
+    Каталог `assets/` при этом создаётся **всегда** — и это не оплошность, а
+    механизм: повторный запуск с нулём ассетов должен очистить прежний
+    каталог, а `commit_tmp` заменяет цель только тем, что принёс. Поэтому
+    здесь проверяется пустой ключ и пустая таблица, а каталог проверяется
+    отдельным тестом «было два, стало ноль».
     """
     storage = MaterialStorage(tmp_path)
     material_id = await _material(engine, tg_id=9006)
@@ -308,6 +311,48 @@ async def test_material_without_images_gets_no_rows_and_no_origin_key(
 
     assert await _rows(engine, material_id) == []
     assert ASSETS_ORIGIN_KEY not in await _origin(engine, material_id)
+
+
+async def test_rerun_without_assets_clears_rows_files_and_the_origin_list(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """Было два ассета, стало ноль — не осталось ни строк, ни файлов, ни перечня.
+
+    Крайний случай повторного запуска, и он держится **только** вместе:
+    каталог `assets/` создаётся даже при нуле ассетов (иначе `commit_tmp`
+    нечем заменить прежний), а ключ `origin.assets` пишется, когда он уже
+    есть (иначе перечень прошлого запуска остался бы жить при пустой
+    таблице). Без второго условия мутация «писать ключ только при наличии
+    ассетов» не ронялась ни одним тестом — нашло ревью PR #53.
+    """
+    storage = MaterialStorage(tmp_path)
+    material_id = await _material(engine, tg_id=9010)
+    assets_dir = storage.permanent_dir(material_id) / ASSETS_DIRNAME
+
+    await _run(
+        sessions, storage, material_id, _adapter([_asset("img001.png"), _asset("img002.png")])
+    )
+    assert len(await _rows(engine, material_id)) == 2
+    assert len(list(assets_dir.iterdir())) == 2
+
+    async with engine.begin() as connection:
+        await connection.execute(
+            Material.__table__.update()
+            .where(Material.id == material_id)
+            .values(completed_stages=[])
+        )
+
+    await _run(sessions, storage, material_id, _adapter())
+
+    assert await _rows(engine, material_id) == [], "строки прошлого запуска остались"
+    assert assets_dir.is_dir(), "каталог ассетов не создан — заменять было бы нечем"
+    assert list(assets_dir.iterdir()) == [], "файлы прошлого запуска остались"
+    origin = await _origin(engine, material_id)
+    assert origin[ASSETS_ORIGIN_KEY] == {"items": []}, "перечень прошлого запуска остался"
+    assert origin["sha256"] == "a" * 64
 
 
 async def test_stage_failure_leaves_neither_rows_nor_files(
