@@ -14,18 +14,29 @@ from pathlib import Path
 
 import pymupdf
 import pytest
+from structlog.testing import capture_logs
 
-from core.adapters.base import IngestCtx
+from core.adapters.base import ExtractedAsset, IngestCtx
 from core.adapters.factory import build_adapter, kind_for_path, known_kind_for_path
-from core.adapters.pdf import RENDER_DPI, VISION_PENDING_KEY, NotAPdfError, PdfAdapter
+from core.adapters.pdf import (
+    MAX_IMAGE_SIDE,
+    RENDER_DPI,
+    VISION_PENDING_KEY,
+    NotAPdfError,
+    PdfAdapter,
+)
 from core.config import Settings
 from core.ingest.budget import estimate_from_probe
 from tests.conftest import ENV_STUB
 from tests.pdf_fixtures import (
     PAGE_ONE_MARKER,
     PAGE_TWO_MARKER,
+    cyrillic_font,
+    figures_pdf,
     lying_page_count_pdf,
     mixed_pdf,
+    oversized_image_pdf,
+    repeated_across_pages_pdf,
     scanned_pdf,
     text_pdf,
     zero_page_pdf,
@@ -325,6 +336,207 @@ async def test_render_refuses_a_page_number_outside_the_document(
 
     # Положительная половина: отказ не достигнут тем, что рендер сломан вовсе.
     assert hashlib.sha256(adapter.render_page(str(path), 2)).hexdigest() == last
+
+
+# --- изображения §5.2 п. 4, §5.3 ------------------------------------------
+
+
+async def _assets(adapter: PdfAdapter, path: Path, tmp_path: Path) -> list[ExtractedAsset]:
+    return [item async for item in adapter.assets(str(path), _ctx(tmp_path))]
+
+
+@pytest.mark.skipif(
+    cyrillic_font() is None,
+    reason="нет системного шрифта с кириллицей: подпись «Рис. N» не набрать",
+)
+async def test_assets_keep_the_numbered_set_and_drop_nothing_else(
+    adapter: PdfAdapter, tmp_path: Path
+) -> None:
+    """§5.2 п. 4: набор «Рис. N» сохраняется целиком, одиночное — по порогу.
+
+    Фикстура: три мелких изображения с подписями «Рис. 1, 2, 3» на первой
+    странице и одно крупное без подписи на второй. Проверяется и состав, и
+    группа: без группы три мелких отбросил бы порог §30.3.
+
+    Это единственный тест, которому нужна **кириллица** в подписи: правило
+    §5.2 п. 4 опознаёт форму «Рис. N», а встроенные шрифты PyMuPDF кириллицы
+    не несут (замер: «Рис. 1» извлекается как «···. 1»). Берётся системный
+    шрифт, а не файл в репозитории (ADR-0007 решение 7).
+
+    Пропуск оформлен `skipif` с видимой причиной, и этого **недостаточно**:
+    пропущенный тест выглядит зелёным прогоном. Поэтому шрифт ставится в CI
+    отдельным шагом (`.github/workflows/ci.yml`) — иначе проверка правила на
+    настоящем разборе PDF не выполнялась бы там вовсе.
+    """
+    path = figures_pdf(tmp_path / "f.pdf", caption_prefix="Рис.")
+
+    assets = await _assets(adapter, path, tmp_path)
+
+    groups = {asset.group_id for asset in assets}
+    assert len(assets) == 4, "состав ассетов изменился"
+    assert groups == {"page1-fig1", None}, "набор не собрался или собрался не тот"
+    in_group = [asset for asset in assets if asset.group_id == "page1-fig1"]
+    assert len(in_group) == 3
+    assert all(
+        asset.area_ratio is not None and asset.area_ratio < 0.02 for asset in in_group
+    ), "набор проверяется не на тех картинках: они обязаны быть ниже порога"
+    assert all(asset.caption is not None for asset in in_group)
+
+
+async def test_repeated_placement_of_one_image_gives_one_asset(
+    adapter: PdfAdapter, tmp_path: Path
+) -> None:
+    """Дедупликация по `xref`. Замер корпуса: 86 лишних размещений, максимум 31.
+
+    В фикстуре крупное изображение второй страницы размещено дважды, и оба
+    размещения выше порога §30.3 — то есть без дедупликации ассетов стало бы
+    два, и в C2 одна и та же картинка ушла бы в vision двумя вызовами.
+    Подписи здесь не нужны: проверка не зависит от наличия кириллического
+    шрифта.
+    """
+    path = figures_pdf(tmp_path / "f.pdf")
+
+    assets = await _assets(adapter, path, tmp_path)
+
+    assert len(assets) == 1, f"дедупликация не сработала: {[a.page for a in assets]}"
+    assert assets[0].page == 2
+    files = [item.name for item in tmp_path.iterdir() if item.suffix != ".pdf"]
+    assert len(files) == 1, f"на диске лишние файлы: {sorted(files)}"
+
+
+async def test_one_image_on_many_pages_gives_one_asset(adapter: PdfAdapter, tmp_path: Path) -> None:
+    """Дедупликация — на весь документ, а не на страницу. §5.2 п. 4.
+
+    Первая редакция держала множество увиденных объектов внутри одной
+    страницы и главный случай не ловила: замер по
+    `tasksans-tech-9-teor-kddt-mun-mosobl-25-26.pdf` — белая подложка лежит на
+    **31 разной странице** по одному размещению, и ассетов выходило 41 вместо
+    11. Нашло ревью PR #48; на том же файле после правки — 8 ассетов
+    (страницы-сканы тоже пропущены).
+
+    Страница первого вхождения запоминается: по ней §23 строит переход к
+    источнику, и «любая из тридцати одной» для этого не годится.
+    """
+    path = repeated_across_pages_pdf(tmp_path / "rep.pdf", pages=3)
+
+    assets = await _assets(adapter, path, tmp_path)
+
+    assert len(assets) == 1, f"дедупликация по документу не сработала: {[a.page for a in assets]}"
+    assert assets[0].page == 1, "запомнена не первая страница"
+    files = [item.name for item in tmp_path.iterdir() if item.suffix != ".pdf"]
+    assert len(files) == 1, f"на диске лишние файлы: {sorted(files)}"
+
+
+async def test_unreadable_image_is_skipped_and_named_in_the_journal(
+    adapter: PdfAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Нечитаемое изображение пропускается, а не валит стадию.
+
+    Отклонение от плана, названное в теле PR: план обещал «отказ своим типом»,
+    но материал из двадцати картинок не должен целиком уходить в `failed`
+    из-за одной в формате, которого Pillow не открывает. Так же решено для
+    страниц-сканов в PR A — пропустить и назвать.
+
+    Подмена на уровне `extract_image`, а не поломанный PDF: формат, который
+    Pillow не открывает (например `jpx`), фикстурой не собрать без кодировщика,
+    а проверяемая ветвь — реакция на нечитаемые байты, откуда бы они ни
+    пришли.
+    """
+    (tmp_path / "ok").mkdir()
+    path = figures_pdf(tmp_path / "f.pdf")
+    document = pymupdf.open(str(path))
+    try:
+        good_xref = max(image[0] for page in document for image in page.get_images(full=True))
+    finally:
+        document.close()
+
+    # Положительная половина считается ДО подмены: фикстура собирается
+    # детерминированно, и в копии файла у изображения тот же `xref` — значит
+    # подмена сломала бы и её, и проверка «остальные прошли» выродилась бы в
+    # «не извлекли ничего» (на этом тест и упал в первой редакции).
+    before = await _assets(adapter, figures_pdf(tmp_path / "ok.pdf"), tmp_path / "ok")
+
+    original = pymupdf.Document.extract_image
+
+    def broken(self: pymupdf.Document, xref: int, *args: object, **kwargs: object) -> dict:
+        if xref == good_xref:
+            return {"ext": "jpeg", "image": b"\xff\xd8\xff\xe0 not an image"}
+        return original(self, xref, *args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(pymupdf.Document, "extract_image", broken)
+
+    with capture_logs() as logs:
+        assets = await _assets(adapter, path, tmp_path)
+
+    skipped = [entry for entry in logs if entry["event"] == "pdf_asset_unreadable"]
+    assert len(skipped) == 1, "пропуск не назван в журнале"
+    assert skipped[0]["xref"] == good_xref
+    assert all(Path(asset.path).exists() for asset in assets), "ассет без файла на диске"
+    assert not any(
+        item.name.endswith(".jpeg") for item in tmp_path.iterdir()
+    ), "обрезок остался во временной директории"
+
+    assert (
+        len(before) == len(assets) + 1
+    ), "пропуск съел больше одного ассета или не произошёл вовсе"
+
+
+async def test_scanned_page_gives_no_assets(adapter: PdfAdapter, tmp_path: Path) -> None:
+    """Страница-скан — предмет vision как страница (§5.2 п. 2), не иллюстрация.
+
+    Замер: изображение скана занимает всю площадь страницы при нуле символов
+    текста, то есть порог §30.3 его пропускает. Без этой ветви материал-скан
+    превратился бы в набор «иллюстраций», каждая из которых — целая страница.
+    """
+    scan = scanned_pdf(tmp_path / "scan.pdf")
+
+    assert await _assets(adapter, scan, tmp_path) == []
+
+    # Положительная половина: тот же адаптер на файле с настоящими
+    # иллюстрациями ассеты даёт — иначе проверка прошла бы и у реализации,
+    # которая не отдаёт ничего никогда.
+    assert await _assets(adapter, figures_pdf(tmp_path / "f.pdf"), tmp_path)
+
+
+async def test_long_side_is_resized_to_the_limit(adapter: PdfAdapter, tmp_path: Path) -> None:
+    """§5.3: ресайз по длинной стороне до 1568 px, и только вниз."""
+    big = await _assets(adapter, oversized_image_pdf(tmp_path / "big.pdf"), tmp_path)
+    small = await _assets(adapter, oversized_image_pdf(tmp_path / "small.pdf", side=800), tmp_path)
+
+    assert len(big) == 1 and len(small) == 1
+    assert max(big[0].width, big[0].height) == MAX_IMAGE_SIDE
+    assert big[0].width / big[0].height == pytest.approx(2.0, abs=0.01), "пропорции не сохранены"
+    assert max(small[0].width, small[0].height) == 800, "мелкую картинку растянули"
+
+
+async def test_assets_are_written_only_into_the_stage_tmp_dir(
+    adapter: PdfAdapter, tmp_path: Path
+) -> None:
+    """§4.2: адаптер пишет только во временную директорию стадии.
+
+    Постоянный путь выбирает стадия (PR C1b). Проверяется не словом докстроки:
+    путь каждого ассета обязан лежать внутри `ctx.tmp_dir`, и файл обязан
+    существовать.
+    """
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir()
+    path = figures_pdf(tmp_path / "f.pdf")
+
+    assets = [item async for item in adapter.assets(str(path), _ctx(stage_dir))]
+
+    assert assets
+    for asset in assets:
+        file = Path(asset.path)
+        assert file.parent == stage_dir, f"ассет записан вне tmp: {file}"
+        assert file.exists() and file.stat().st_size > 0
+        assert asset.mime.startswith("image/")
+
+
+async def test_a_document_without_images_yields_no_assets(
+    adapter: PdfAdapter, tmp_path: Path
+) -> None:
+    """Текстовый PDF ассетов не даёт — и это не ошибка."""
+    assert await _assets(adapter, text_pdf(tmp_path / "t.pdf"), tmp_path) == []
 
 
 # --- error case: не-PDF §5.1 -----------------------------------------------
