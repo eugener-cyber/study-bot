@@ -21,7 +21,7 @@ from arq import ArqRedis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.progress import ProgressMessage, stage_text
-from core.adapters.factory import IMAGE_KIND, known_kind_for_path
+from core.adapters.factory import IMAGE_KIND, PENDING_KINDS, known_kind_for_path
 from core.ingest.awaiting import remember_message
 from core.logging import get_logger
 from core.services.materials import create_or_find, sha256_of
@@ -66,10 +66,19 @@ def _kind_of(message: Message) -> str | None:
     Соответствие «расширение → тип» берётся из фабрики адаптеров, а не
     выводится здесь: второй вывод одной карты уже расходился с первым —
     фотография получала тип `image` здесь и `text` в фабрике (замечание ревью
-    PR #42).
+    PR #42, фаза 1).
+
+    Документ принимается, только если его тип **уже умеет обрабатываться**:
+    `PENDING_KINDS` перечисляет типы, у которых адаптера пока нет. Иначе
+    приём молча расширился бы — файл `.jpg`, присланный документом, стал бы
+    материалом `image`, дошёл бы до воркера и упал бы на выборе адаптера, то
+    есть вместо честного отказа человек получил бы отказ обработки
+    (замечание ревью PR #42, фаза 2). Фотография — отдельная ветвь: её приём
+    требует §26, и он был здесь до этого пакета.
     """
     if message.document:
-        return known_kind_for_path((message.document.file_name or "").lower())
+        kind = known_kind_for_path((message.document.file_name or "").lower())
+        return None if kind is None or kind in PENDING_KINDS else kind
     if message.photo:
         return IMAGE_KIND
     return None
