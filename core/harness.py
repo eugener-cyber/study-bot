@@ -27,6 +27,7 @@ import asyncio
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -40,6 +41,7 @@ from core.db.engine import build_engine, build_sessionmaker
 from core.db.models import Fragment, Material, MediaAsset, User
 from core.db.session import session_scope
 from core.ingest import handlers as h
+from core.ingest.handlers import ASSETS_ORIGIN_KEY
 from core.ingest.pipeline import StageHandler, process_material
 from core.learning.checking import InvalidAnswerError
 from core.learning.explain import format_duration
@@ -237,7 +239,11 @@ async def dump_material(material_id: int) -> int:
                 "они ждут распознавания и заданий пока не дают"
             )
         if assets:
-            print(_assets_block(assets, MATERIALS_ROOT))
+            items = ((origin or {}).get(ASSETS_ORIGIN_KEY) or {}).get("items") or []
+            measurements = {
+                int(item["asset_id"]): item for item in items if item.get("asset_id") is not None
+            }
+            print(_assets_block(assets, measurements, MATERIALS_ROOT))
         print()
         for ord_, frag_kind, locator, quality, tokens, text in fragments:
             print(_fragment_line(ord_, frag_kind, locator or {}, quality, tokens, text))
@@ -248,6 +254,7 @@ async def dump_material(material_id: int) -> int:
 
 def _assets_block(
     rows: Sequence[tuple[int, str | None, str | None]],
+    measurements: dict[int, dict[str, Any]],
     root: str,
 ) -> str:
     """Ассеты материала: страница, площадь, подпись, группа и наличие файла.
@@ -259,8 +266,16 @@ def _assets_block(
     шагами оставляет ссылку без файла. §6.3 требует видимых последствий.
 
     Перечень измерений (страница, доля площади, группа) берётся из
-    `materials.origin`: колонок под них в `media_assets` нет, постоянное место
-    группы — локатор фрагмента (§3.4), и это долг C2 (ADR-0008).
+    `materials.origin` и сопоставляется со строками по `asset_id`: колонок под
+    них в `media_assets` нет, постоянное место группы — локатор фрагмента
+    (§3.4), и это долг C2 (ADR-0008). Ассет, которого нет в перечне, печатается
+    с «стр. —»: это видимое расхождение между таблицей и `origin`, а не
+    молчаливый пропуск.
+
+    Первая редакция этой функции измерения **не читала**, хотя докстрока
+    утверждала обратное, — и приёмка «группа из десяти на стр. 10 видна в
+    `dump-material`» не выполнялась. Нашло ревью PR #53; тесты были зелёными
+    потому, что проверяли только число ассетов и пометку о файле.
     """
     lines = [f"ассетов: {len(rows)}"]
     for asset_id, path, caption in rows:
@@ -268,7 +283,16 @@ def _assets_block(
         mark = "" if exists else "  ⚠️ файла нет по пути"
         shown = (caption or "").strip().replace("\n", " ")
         tail = f" «{shown[:40]}»" if shown else ""
-        lines.append(f"  id={asset_id} {path}{tail}{mark}")
+
+        item = measurements.get(asset_id, {})
+        page = item.get("page")
+        ratio = item.get("area_ratio")
+        group = item.get("group_id")
+        where = f"стр. {page}" if page is not None else "стр. —"
+        area = f" {float(ratio):.4f}" if isinstance(ratio, (int, float)) else ""
+        band = f" [{group}]" if group else ""
+
+        lines.append(f"  id={asset_id} {where}{area}{band} {path}{tail}{mark}")
     return "\n".join(lines)
 
 
