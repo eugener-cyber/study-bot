@@ -268,3 +268,26 @@ def oversized_image_pdf(path: Path, *, side: int = 1800) -> Path:
     document.save(str(path))
     document.close()
     return path
+
+
+def repeated_across_pages_pdf(path: Path, *, pages: int = 3) -> Path:
+    """Одно изображение на нескольких страницах по одному размещению.
+
+    Главный случай дедупликации, и он **не** внутристраничный: замер по
+    `tasksans-tech-9-teor-kddt-mun-mosobl-25-26.pdf` — белая подложка лежит на
+    31 разной странице по одному размещению, и область «внутри страницы»
+    давала 41 ассет вместо 11. Первая редакция фикстуры повторяла картинку на
+    одной странице и этот случай не проверяла (нашло ревью PR #48).
+
+    Картинка крупная: порог §30.3 её пропускает, то есть проверяется именно
+    дедупликация, а не отбор по площади.
+    """
+    document = pymupdf.open()
+    big = _png_bytes(300, 300, (40, 120, 220))
+    for index in range(pages):
+        page = document.new_page()
+        page.insert_image(pymupdf.Rect(100, 100, 400, 400), stream=big)
+        _fill_text_layer(page, f"{BODY_ONE} Page {index + 1}.")
+    document.save(str(path))
+    document.close()
+    return path

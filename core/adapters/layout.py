@@ -434,16 +434,27 @@ def keep_pictures(
             if not members:
                 continue
             first = run[0][1]
+            # Подпись-владелец каждой картинки, а не первая подпись ряда:
+            # ряд может начинаться подписью без картинок, и тогда одиночный
+            # ассет получал бы чужой текст в `media_assets.caption`.
+            # Воспроизведено ревью PR #48: картинка под «Рис. 2» получала
+            # подпись «Рис. 1».
+            owners = {id(picture): caption for index, caption in run for picture in assigned[index]}
             if len(members) == 1:
                 # Набор из одной картинки набором не является: `group_id`
                 # называет набор, и на одиночной подписи он означал бы набор
                 # из одного элемента, который `match_image` собрать не может
                 # (§9.2 требует минимум двух пар).
                 if members[0].area_ratio > min_area_ratio:
-                    kept.append(KeptPicture(picture=members[0], group_id=None, caption=first))
+                    kept.append(
+                        KeptPicture(
+                            picture=members[0],
+                            group_id=None,
+                            caption=owners.get(id(members[0])),
+                        )
+                    )
                 continue
             group_id = f"page{first.page}-fig{first.number}"
-            owners = {id(picture): caption for index, caption in run for picture in assigned[index]}
             kept.extend(
                 KeptPicture(
                     picture=picture,

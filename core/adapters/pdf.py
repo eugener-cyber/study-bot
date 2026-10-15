@@ -273,6 +273,14 @@ class PdfAdapter(SourceAdapter):
         try:
             pictures: list[Picture] = []
             blocks: list[Block] = []
+            # Множество увиденных объектов — на **весь документ**, а не на
+            # страницу. Первая редакция создавала его в `_pictures_of`, то
+            # есть заново на каждой странице, и не ловила главный случай:
+            # замер по `tasksans-tech-9-teor-kddt-mun-mosobl-25-26.pdf` —
+            # белая подложка (`xref` 96) лежит на 31 **разной** странице по
+            # одному размещению, и дедупликация по странице давала 41 ассет
+            # вместо 11. Нашло ревью PR #48.
+            seen: set[int] = set()
             for index in range(document.page_count):
                 page = document.load_page(index)
                 human_page = index + 1
@@ -286,7 +294,7 @@ class PdfAdapter(SourceAdapter):
                     log.info("pdf_page_awaits_vision", page=human_page)
                     continue
                 blocks.extend(_blocks_of(page, human_page))
-                pictures.extend(_pictures_of(page, human_page))
+                pictures.extend(_pictures_of(page, human_page, seen))
 
             kept = keep_pictures(
                 pictures,
@@ -294,15 +302,32 @@ class PdfAdapter(SourceAdapter):
                 min_area_ratio=self._settings.MIN_IMAGE_AREA_RATIO,
             )
             out: list[ExtractedAsset] = []
+            skipped = 0
             for number, item in enumerate(kept, start=1):
-                out.append(
-                    _write_asset(
-                        document,
-                        item,
-                        tmp_dir=ctx.tmp_dir,
-                        name=f"img{number:03d}",
+                try:
+                    out.append(
+                        _write_asset(
+                            document,
+                            item,
+                            tmp_dir=ctx.tmp_dir,
+                            name=f"img{number:03d}",
+                        )
                     )
-                )
+                except OSError:
+                    # Нечитаемое изображение **пропускается**, а не валит
+                    # стадию. План обещал «отказ своим типом»; отклонение
+                    # названо в теле PR с доводом: материал из двадцати
+                    # картинок не должен целиком уходить в `failed` из-за
+                    # одной в формате, которого Pillow не открывает. Так же
+                    # решено для страниц-сканов в PR A — пропустить и назвать.
+                    # Последствие видимо: запись в журнале, а в PR C1b — число
+                    # в `materials.origin` рядом с пропущенными страницами.
+                    skipped += 1
+                    log.info(
+                        "pdf_asset_unreadable",
+                        page=item.picture.page,
+                        xref=item.picture.xref,
+                    )
         finally:
             document.close()
 
@@ -310,6 +335,7 @@ class PdfAdapter(SourceAdapter):
             "pdf_assets_extracted",
             total=len(pictures),
             kept=len(out),
+            skipped=skipped,
             groups=len({item.group_id for item in out if item.group_id}),
         )
         for asset in out:
@@ -365,15 +391,19 @@ def _page_index(page: int, page_count: int) -> int:
     return page - 1
 
 
-def _pictures_of(page: pymupdf.Page, human_page: int) -> list[Picture]:
+def _pictures_of(page: pymupdf.Page, human_page: int, seen: set[int]) -> list[Picture]:
     """Изображения страницы с долей площади и идентификатором объекта.
 
-    Дедупликация — здесь, по `xref` **внутри страницы**: одно изображение
-    размещается на странице по нескольку раз, и каждое размещение даёт свой
-    прямоугольник. Берётся первое; остальные — тот же файл, и порог площади
-    они всё равно проходят или нет одинаково. Замер по корпусу 49 файлов: 86
-    лишних размещений в 10 файлах, максимум 31 копия — белая подложка
-    страницы с долей площади 0.69.
+    `seen` принадлежит **документу** и приходит снаружи: одно изображение
+    размещается и по нескольку раз на странице, и на разных страницах, а §5.2
+    п. 4 требует считать повторные размещения одного объекта одним ассетом.
+    Замеры: по корпусу 49 файлов — 86 лишних размещений в 10 файлах; в
+    `tasksans-tech-9-teor-kddt-mun-mosobl-25-26.pdf` белая подложка (`xref`
+    96) лежит на **31 разной странице** по одному размещению, и область
+    «внутри страницы» не ловила её вовсе: 41 ассет вместо 11.
+
+    Первое вхождение задаёт страницу и площадь. Остальные — тот же файл, и
+    порог площади они всё равно проходят или нет одинаково.
 
     Площадь страницы берётся из `page.rect`, а не из константы A4: материалы
     бывают любого формата, и доля считается относительно своей страницы (§30.3
@@ -385,7 +415,6 @@ def _pictures_of(page: pymupdf.Page, human_page: int) -> list[Picture]:
         return []
 
     out: list[Picture] = []
-    seen: set[int] = set()
     for image in page.get_images(full=True):
         xref = int(image[0])
         if xref in seen:
@@ -428,15 +457,25 @@ def _write_asset(
     path = Path(tmp_dir) / f"{name}.{extension}"
     path.write_bytes(bytes(raw["image"]))
 
-    with Image.open(path) as image:
-        width, height = image.size
-        longest = max(width, height)
-        if longest > MAX_IMAGE_SIDE:
-            scale = MAX_IMAGE_SIDE / longest
-            resized = image.resize((round(width * scale), round(height * scale)))
-            resized.save(path)
-            width, height = resized.size
-        mime = Image.MIME.get(image.format or "", f"image/{extension}")
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+            longest = max(width, height)
+            if longest > MAX_IMAGE_SIDE:
+                scale = MAX_IMAGE_SIDE / longest
+                resized = image.resize((round(width * scale), round(height * scale)))
+                resized.save(path)
+                width, height = resized.size
+            mime = Image.MIME.get(image.format or "", f"image/{extension}")
+    except OSError:
+        # Файл удаляется до повторного подъёма: иначе во временной
+        # директории остался бы обрезок, который конвейер перенёс бы в
+        # постоянное хранилище как ассет без строки в базе (§4.2).
+        # `UnidentifiedImageError` — потомок встроенного `OSError`, поэтому
+        # ловящему не нужен импорт Pillow, и тип библиотеки наружу не уезжает
+        # (урок PR #42, FAIL 8.1).
+        path.unlink(missing_ok=True)
+        raise
 
     return ExtractedAsset(
         path=str(path),

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pymupdf
 import pytest
+from structlog.testing import capture_logs
 
 from core.adapters.base import ExtractedAsset, IngestCtx
 from core.adapters.factory import build_adapter, kind_for_path, known_kind_for_path
@@ -35,6 +36,7 @@ from tests.pdf_fixtures import (
     lying_page_count_pdf,
     mixed_pdf,
     oversized_image_pdf,
+    repeated_across_pages_pdf,
     scanned_pdf,
     text_pdf,
     zero_page_pdf,
@@ -400,6 +402,83 @@ async def test_repeated_placement_of_one_image_gives_one_asset(
     assert assets[0].page == 2
     files = [item.name for item in tmp_path.iterdir() if item.suffix != ".pdf"]
     assert len(files) == 1, f"на диске лишние файлы: {sorted(files)}"
+
+
+async def test_one_image_on_many_pages_gives_one_asset(adapter: PdfAdapter, tmp_path: Path) -> None:
+    """Дедупликация — на весь документ, а не на страницу. §5.2 п. 4.
+
+    Первая редакция держала множество увиденных объектов внутри одной
+    страницы и главный случай не ловила: замер по
+    `tasksans-tech-9-teor-kddt-mun-mosobl-25-26.pdf` — белая подложка лежит на
+    **31 разной странице** по одному размещению, и ассетов выходило 41 вместо
+    11. Нашло ревью PR #48; на том же файле после правки — 8 ассетов
+    (страницы-сканы тоже пропущены).
+
+    Страница первого вхождения запоминается: по ней §23 строит переход к
+    источнику, и «любая из тридцати одной» для этого не годится.
+    """
+    path = repeated_across_pages_pdf(tmp_path / "rep.pdf", pages=3)
+
+    assets = await _assets(adapter, path, tmp_path)
+
+    assert len(assets) == 1, f"дедупликация по документу не сработала: {[a.page for a in assets]}"
+    assert assets[0].page == 1, "запомнена не первая страница"
+    files = [item.name for item in tmp_path.iterdir() if item.suffix != ".pdf"]
+    assert len(files) == 1, f"на диске лишние файлы: {sorted(files)}"
+
+
+async def test_unreadable_image_is_skipped_and_named_in_the_journal(
+    adapter: PdfAdapter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Нечитаемое изображение пропускается, а не валит стадию.
+
+    Отклонение от плана, названное в теле PR: план обещал «отказ своим типом»,
+    но материал из двадцати картинок не должен целиком уходить в `failed`
+    из-за одной в формате, которого Pillow не открывает. Так же решено для
+    страниц-сканов в PR A — пропустить и назвать.
+
+    Подмена на уровне `extract_image`, а не поломанный PDF: формат, который
+    Pillow не открывает (например `jpx`), фикстурой не собрать без кодировщика,
+    а проверяемая ветвь — реакция на нечитаемые байты, откуда бы они ни
+    пришли.
+    """
+    (tmp_path / "ok").mkdir()
+    path = figures_pdf(tmp_path / "f.pdf")
+    document = pymupdf.open(str(path))
+    try:
+        good_xref = max(image[0] for page in document for image in page.get_images(full=True))
+    finally:
+        document.close()
+
+    # Положительная половина считается ДО подмены: фикстура собирается
+    # детерминированно, и в копии файла у изображения тот же `xref` — значит
+    # подмена сломала бы и её, и проверка «остальные прошли» выродилась бы в
+    # «не извлекли ничего» (на этом тест и упал в первой редакции).
+    before = await _assets(adapter, figures_pdf(tmp_path / "ok.pdf"), tmp_path / "ok")
+
+    original = pymupdf.Document.extract_image
+
+    def broken(self: pymupdf.Document, xref: int, *args: object, **kwargs: object) -> dict:
+        if xref == good_xref:
+            return {"ext": "jpeg", "image": b"\xff\xd8\xff\xe0 not an image"}
+        return original(self, xref, *args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(pymupdf.Document, "extract_image", broken)
+
+    with capture_logs() as logs:
+        assets = await _assets(adapter, path, tmp_path)
+
+    skipped = [entry for entry in logs if entry["event"] == "pdf_asset_unreadable"]
+    assert len(skipped) == 1, "пропуск не назван в журнале"
+    assert skipped[0]["xref"] == good_xref
+    assert all(Path(asset.path).exists() for asset in assets), "ассет без файла на диске"
+    assert not any(
+        item.name.endswith(".jpeg") for item in tmp_path.iterdir()
+    ), "обрезок остался во временной директории"
+
+    assert (
+        len(before) == len(assets) + 1
+    ), "пропуск съел больше одного ассета или не произошёл вовсе"
 
 
 async def test_scanned_page_gives_no_assets(adapter: PdfAdapter, tmp_path: Path) -> None:

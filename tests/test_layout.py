@@ -558,6 +558,32 @@ def test_single_captioned_picture_is_not_a_group() -> None:
     assert kept[0].group_id is None
 
 
+def test_a_single_asset_gets_its_own_caption_not_the_first_of_the_run() -> None:
+    """Подпись одиночного ассета — его собственная. Ревью PR #48.
+
+    Ряд может начинаться подписью без картинок: «Рис. 1» без иллюстрации и
+    «Рис. 2» со своей. Первая редакция писала в `KeptPicture.caption` первую
+    подпись ряда, и картинка под «Рис. 2» получала текст «Рис. 1» — а он
+    уезжает в `media_assets.caption` и дальше в описание vision (C2).
+
+    На корпусе таких страниц сегодня ноль, поэтому тест стоит на
+    сконструированной раскладке: ошибка нашлась чтением кода, а не данными, и
+    закрепить её нужно до того, как она проявится на материале.
+    """
+    picture = _pic(3, 0.05, x0=220.0, y=100.0)
+    captions = [
+        _cap(3, 1, x0=60.0, y=210.0, text="Рис. 1. Без картинки"),
+        _cap(3, 2, x0=220.0, y=210.0, text="Рис. 2. Своя"),
+    ]
+
+    kept = keep_pictures([picture], captions, min_area_ratio=MIN_AREA_RATIO)
+
+    assert len(kept) == 1
+    assert kept[0].caption is not None
+    assert kept[0].caption.text == "Рис. 2. Своя", "ассет получил чужую подпись"
+    assert kept[0].group_id is None, "набор из одной картинки набором не считается"
+
+
 def test_sets_on_different_pages_do_not_merge() -> None:
     pictures = [
         _pic(2, 0.009, x0=60.0, y=100.0),
