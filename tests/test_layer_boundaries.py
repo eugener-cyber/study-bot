@@ -181,15 +181,31 @@ def test_mypy_relaxation_covers_exactly_one_module() -> None:
 def test_assets_is_optional_in_the_contract() -> None:
     """§5.1 v3.17: третий метод необязательный — адаптер без медиафайлов цел.
 
-    Проверяется на заглушке, которая `assets` не переопределяет: если метод
-    станет `@abstractmethod`, заглушка перестанет создаваться, и тест
-    покраснеет здесь, а не в шести местах конвейера.
+    Проверяется на **минимальном** адаптере, объявленном здесь же: он
+    реализует только `probe` и `extract`. Первая редакция теста смотрела в
+    `StubAdapter.__dict__`, и когда заглушка получила `assets` ради тестов
+    стадии, проверка сломалась — она держалась случайного факта о заглушке, а
+    не на контракте. Если метод станет `@abstractmethod`, этот класс
+    перестанет создаваться, и тест покраснеет здесь.
     """
-    from core.adapters.stub import StubAdapter
+    from collections.abc import AsyncIterator
 
-    adapter = StubAdapter()
+    from core.adapters.base import ExtractedFragment, IngestCtx, SourceAdapter, SourceMeta
 
-    assert "assets" not in StubAdapter.__dict__, "заглушка переопределила необязательный метод"
+    class Minimal(SourceAdapter):
+        kind = "minimal"
+
+        async def probe(self, path: str) -> SourceMeta:
+            return SourceMeta()
+
+        async def extract(self, path: str, ctx: IngestCtx) -> AsyncIterator[ExtractedFragment]:
+            empty: tuple[ExtractedFragment, ...] = ()
+            for fragment in empty:
+                yield fragment
+
+    adapter = Minimal()
+
+    assert "assets" not in Minimal.__dict__, "минимальный адаптер переопределил метод"
     assert hasattr(adapter, "assets")
 
 
@@ -202,6 +218,9 @@ async def test_default_assets_yields_nothing_and_is_an_iterator() -> None:
     from core.adapters.base import IngestCtx
     from core.adapters.stub import StubAdapter
 
+    # Заглушка без заданных ассетов: её `assets` отдаёт пустой поток, как и
+    # реализация по умолчанию. Сама реализация по умолчанию проверена в тесте
+    # выше на минимальном адаптере.
     stream = StubAdapter().assets("/tmp/нет", IngestCtx(material_id=1, tmp_dir="/tmp"))
 
     assert hasattr(stream, "__anext__"), "метод вернул не асинхронный итератор"
