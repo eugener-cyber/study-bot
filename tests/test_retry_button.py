@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 from unittest.mock import AsyncMock
 
@@ -342,7 +343,7 @@ async def test_second_tap_does_not_enqueue_twice(
 
     Нажатия идут одно за другим в одной транзакции — это проверяет
     идемпотентность по статусу, но **не** отсутствие окна между чтением и
-    записью: перекрытие транзакций нужно проверять отдельно.
+    записью. Перекрытие транзакций проверяет тест ниже.
     """
     material_id = await _material(engine)
     arq = FakeArq()
@@ -352,3 +353,62 @@ async def test_second_tap_does_not_enqueue_twice(
         await handle_retry(_callback(material_id), session, arq)
 
     assert len(arq.jobs) == 1
+
+
+async def test_overlapping_taps_collide_on_the_row_lock(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§38 №8, §36 «Гонки»: право на повтор получает ровно один тап.
+
+    Транзакции обязаны **перекрываться**, а не идти одна за другой. Прежний
+    тест двойного тапа шёл последовательно в одной сессии, и ревью PR #59
+    показало то же, что ревью PR #34 на ответе задания: при замене условного
+    `UPDATE` чтением перед записью он оставался зелёным. То есть утверждение
+    «окна между чтением и записью нет» не проверялось ничем.
+
+    Перекрытие задаётся **событием**, а не задержкой: задержка зависит от
+    скорости базы и невоспроизводима. Победитель удерживается в точке
+    **после** захвата строки — подменена правка сообщения, первое, что
+    `handle_retry` делает после условного `UPDATE`. Второй тап в это время
+    упирается в блокировку строки на уровне Postgres, и то, что он
+    действительно заблокирован, проверяется положительным ассертом до любых
+    выводов о результате.
+    """
+    import bot.handlers.retry as handler
+
+    material_id = await _material(engine)
+    arq = FakeArq()
+
+    claimed = asyncio.Event()
+    release = asyncio.Event()
+    real_refresh = handler._refresh_message
+
+    async def holding_refresh(*args: object, **kwargs: object) -> int | None:
+        claimed.set()
+        await release.wait()
+        return await real_refresh(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(handler, "_refresh_message", holding_refresh)
+
+    async def tap() -> None:
+        async with session_scope(sessions) as session:
+            await handle_retry(_callback(material_id), session, arq)
+
+    winner = asyncio.create_task(tap())
+    await asyncio.wait_for(claimed.wait(), timeout=10)
+
+    loser = asyncio.create_task(tap())
+    await asyncio.sleep(0.3)
+
+    # Положительный ассерт первым: столкновение действительно произошло.
+    assert not loser.done(), "второй тап не заблокирован — транзакции не перекрылись"
+    assert not winner.done(), "первый тап уже завершился — удержание не сработало"
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(winner, loser), timeout=10)
+
+    assert len(arq.jobs) == 1, f"задач {len(arq.jobs)} — право на повтор получили оба"
+    assert (await _state(engine, material_id))[0] == "processing"
