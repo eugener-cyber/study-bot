@@ -26,13 +26,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import Settings
 from core.db.models import Material
 from core.logging import get_logger
+from core.services.materials import MESSAGE_ID_KEY, mark_failed, progress_of
 
 log = get_logger(__name__)
 
 AWAITING_STAGE = "awaiting_user"
 """Значение `progress.stage` при ожидании. §4.5 называет его буквально."""
 
-MESSAGE_ID_KEY = "message_id"
 """Ключ с идентификатором сообщения прогресса внутри `progress`.
 
 §4.5 требует «одно сообщение, редактируемое `edit_message_text`», но §3 поля
@@ -66,7 +66,7 @@ async def park(
     §4.1 перечисляет четыре статуса, и пятый сломал бы все выборки по
     `status`, написанные по спецификации.
     """
-    previous = await _progress(session, material_id)
+    previous = await progress_of(session, material_id)
     progress: dict[str, Any] = {
         "stage": AWAITING_STAGE,
         "question": question,
@@ -95,31 +95,19 @@ async def resume(session: AsyncSession, material_id: int) -> None:
     материала целиком, и затирать его значило бы потерять сообщение прогресса
     после каждого подтверждения (§4.5 «одно сообщение»).
     """
-    previous = await _progress(session, material_id)
+    previous = await progress_of(session, material_id)
     kept = {MESSAGE_ID_KEY: previous[MESSAGE_ID_KEY]} if MESSAGE_ID_KEY in previous else {}
     await session.execute(update(Material).where(Material.id == material_id).values(progress=kept))
     log.info("material_resumed", material_id=material_id)
 
 
-async def _progress(session: AsyncSession, material_id: int) -> dict[str, Any]:
-    """`materials.progress` материала, всегда словарём.
-
-    `None` приводится к пустому словарю: §3 объявляет поле nullable, и каждому
-    вызывающему иначе пришлось бы проверять это самому — а забытая проверка
-    даёт `AttributeError` на `None.get`.
-    """
-    result = await session.execute(select(Material.progress).where(Material.id == material_id))
-    raw: dict[str, Any] | None = result.scalar_one()
-    return dict(raw) if raw else {}
-
-
 async def is_awaiting(session: AsyncSession, material_id: int) -> bool:
-    return (await _progress(session, material_id)).get("stage") == AWAITING_STAGE
+    return (await progress_of(session, material_id)).get("stage") == AWAITING_STAGE
 
 
 async def awaiting_kind(session: AsyncSession, material_id: int) -> str | None:
     """Чего именно ждут от пользователя, или `None`, если не ждут."""
-    progress = await _progress(session, material_id)
+    progress = await progress_of(session, material_id)
     if progress.get("stage") != AWAITING_STAGE:
         return None
     kind = progress.get("kind")
@@ -133,7 +121,7 @@ async def remember_message(session: AsyncSession, material_id: int, message_id: 
     воркер, и передать идентификатор иначе нечем — задача ARQ получает только
     аргументы, а сообщение появляется до её постановки.
     """
-    progress = await _progress(session, material_id)
+    progress = await progress_of(session, material_id)
     progress[MESSAGE_ID_KEY] = message_id
     await session.execute(
         update(Material).where(Material.id == material_id).values(progress=progress)
@@ -146,7 +134,7 @@ async def progress_message_id(session: AsyncSession, material_id: int) -> int | 
     `None` — нормальный исход: материал мог прийти через `make seed`, где
     Telegram не участвует вовсе.
     """
-    value = (await _progress(session, material_id)).get(MESSAGE_ID_KEY)
+    value = (await progress_of(session, material_id)).get(MESSAGE_ID_KEY)
     return int(value) if value is not None else None
 
 
@@ -187,18 +175,17 @@ async def expire_stale(session: AsyncSession, settings: Settings) -> list[int]:
     if not expired:
         return []
 
-    await session.execute(
-        update(Material)
-        .where(Material.id.in_(expired))
-        .values(
-            status="failed",
-            error=(
-                "Обработка остановлена: не получен ответ на вопрос о материале "
-                f"в течение {settings.AWAITING_USER_TIMEOUT_H} часов. "
-                "Нажмите «Обработать заново», чтобы начать снова."
-            ),
-            progress={},
+    # `message_id` сохраняется у каждого материала по отдельности: он разный, и
+    # одним `UPDATE` на всех его не перенести. `progress={}` в первой редакции
+    # затирал его вместе с остальным, и сообщение о тайм-ауте было бы некуда
+    # отправить — тот же дефект, что у `mark_failed` (Issue #44).
+    for material_id in expired:
+        await mark_failed(
+            session,
+            material_id,
+            "Обработка остановлена: не получен ответ на вопрос о материале "
+            f"в течение {settings.AWAITING_USER_TIMEOUT_H} часов. "
+            "Нажмите «Обработать заново», чтобы начать снова.",
         )
-    )
     log.info("awaiting_expired", count=len(expired), material_ids=expired)
     return expired

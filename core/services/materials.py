@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -159,16 +159,56 @@ async def mark_ready(session: AsyncSession, material_id: int) -> None:
     log.info("material_ready", material_id=material_id)
 
 
+MESSAGE_ID_KEY: Final = "message_id"
+"""Ключ `materials.progress` с идентификатором сообщения прогресса (§4.5).
+
+Живёт здесь, а не в стадии ожидания, потому что относится к материалу целиком:
+его читают и пишут и приём файла, и гейт бюджета, и воркер, и отказ. Пока он
+лежал в `core/ingest/awaiting.py`, сервису пришлось бы импортировать стадию —
+то есть развернуть направление зависимости, в котором `core/ingest/gate.py`
+уже вызывает этот модуль.
+"""
+
+
+async def progress_of(session: AsyncSession, material_id: int) -> dict[str, Any]:
+    """`materials.progress` материала, всегда словарём.
+
+    `None` приводится к пустому словарю: §3 объявляет поле nullable, и каждому
+    вызывающему иначе пришлось бы проверять это самому — а забытая проверка
+    даёт `AttributeError` на `None.get`.
+    """
+    raw: dict[str, Any] | None = (
+        await session.execute(select(Material.progress).where(Material.id == material_id))
+    ).scalar_one()
+    return dict(raw) if raw else {}
+
+
 async def mark_failed(session: AsyncSession, material_id: int, reason: str) -> None:
     """Переводит материал в `failed` с причиной (§4.1).
 
     Причина обязательна параметром, а не необязательна: материал в `failed`
     без текста выглядит сбоем системы, и пользователь будет искать поломку
     вместо того, чтобы нажать «Обработать заново».
+
+    **`message_id` сохраняется**, остальной `progress` затирается — так же, как
+    это делает `resume` (§4.5 «одно сообщение»). Первая редакция ставила
+    `progress={}`, и сообщение об отказе не доходило до человека вовсе: воркер
+    вызывает `_show_failed` **после** `mark_failed`, тот берёт `message_id` из
+    `progress`, не находит и молча возвращает `False`. Тесты этого не ловили —
+    они проверяли запись в `materials.error`, то есть след, а не наблюдаемое
+    поведение. Нашло ревью Плана по Issue #44.
+
+    Остальные ключи затираются намеренно: `stage`, `question` и `payload`
+    относятся к прошлой попытке, и в следующей они означали бы ожидание,
+    которого нет.
     """
+    previous = await progress_of(session, material_id)
+    kept: dict[str, Any] = (
+        {MESSAGE_ID_KEY: previous[MESSAGE_ID_KEY]} if MESSAGE_ID_KEY in previous else {}
+    )
     await session.execute(
         update(Material)
         .where(Material.id == material_id)
-        .values(status="failed", error=reason, progress={})
+        .values(status="failed", error=reason, progress=kept)
     )
-    log.info("material_failed", material_id=material_id)
+    log.info("material_failed", material_id=material_id, message_kept=bool(kept))
