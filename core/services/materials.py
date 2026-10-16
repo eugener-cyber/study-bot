@@ -18,7 +18,7 @@ from typing import Any, Final
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.db.models import Material
+from core.db.models import Material, User
 from core.logging import get_logger
 
 log = get_logger(__name__)
@@ -224,3 +224,54 @@ async def mark_failed(session: AsyncSession, material_id: int, reason: str) -> N
         .values(status="failed", error=reason, progress=kept)
     )
     log.info("material_failed", material_id=material_id, message_kept=bool(kept))
+
+
+async def claim_failed_for_retry(
+    session: AsyncSession, material_id: int, tg_id: int
+) -> dict[str, Any] | None:
+    """Забирает отказавший материал на повторную обработку (§4.5).
+
+    Возвращает `materials.origin` забранного материала (пустым словарём, если
+    его нет) или `None`, если забрать не удалось: материала нет, он
+    принадлежит другому человеку или он не в `failed`.
+
+    **Право на действие выдаёт база**, а не проверка перед записью: условный
+    `UPDATE … WHERE status='failed' AND user_id=… RETURNING` либо меняет
+    строку, либо нет, и второй одновременный тап получает пустой результат.
+    Проверка «статус failed?» отдельным запросом оставила бы окно между
+    чтением и записью — при `READ COMMITTED` это ровно тот дефект, который
+    ловился в WP-05 на двойном нажатии ответа.
+
+    Владелец сверяется **в том же** `UPDATE`, и `None` на все три причины
+    отказа — тоже часть условия: подставить чужой `material_id` в
+    `callback_data` ничто не мешает, а отдельный запрос про владельца дал бы
+    разный наблюдаемый ответ для «чужого существующего» и «несуществующего»
+    материала — утечку факта существования, которая ловилась в ревью WP-05.
+    Поэтому причина отказа не возвращается наружу вовсе: вызывающему её
+    нечем было бы отличить, не нарушив неразличимость.
+
+    `completed_stages` **не** сбрасывается: §4.2 «при исключении до COMMIT
+    `completed_stages` не меняется, следующая попытка начинает стадию
+    заново» — пройденные стадии остаются пройденными, а повтор продолжает с
+    упавшей. Сброс означал бы повторные вызовы модели по уже выполненным
+    стадиям, то есть расход бюджета §6.3 без результата.
+    """
+    claimed = (
+        await session.execute(
+            update(Material)
+            .where(
+                Material.id == material_id,
+                Material.status == "failed",
+                Material.user_id.in_(select(User.id).where(User.tg_id == tg_id)),
+            )
+            .values(status="processing", error=None)
+            .returning(Material.origin)
+        )
+    ).first()
+
+    if claimed is None:
+        log.info("material_retry_rejected", material_id=material_id, tg_id=tg_id)
+        return None
+
+    log.info("material_retry_claimed", material_id=material_id, tg_id=tg_id)
+    return dict(claimed[0] or {})

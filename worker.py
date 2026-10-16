@@ -29,8 +29,8 @@ from arq.connections import RedisSettings
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from bot.callbacks import retry_keyboard
 from bot.handlers.gate import gate_keyboard
-from bot.handlers.retry import retry_keyboard
 from bot.main import LOCAL_BOT_API
 from bot.progress import stage_text
 from core.adapters.base import SourceAdapter
@@ -352,15 +352,25 @@ def unsupported_kind_text(kind: str) -> str:
 
 
 async def _show_failed(ctx: dict[str, Any], material_id: int, *, with_retry: bool = True) -> None:
-    """Показывает причину отказа, записанную в `materials.error` (§4.1).
+    """Показывает причину отказа, записанную в `materials.error` (§4.5).
 
     Текст берётся из базы, а не из литерала здесь: его пишет тот, кто знает
     причину — `mark_failed` при сбое стадии и `expire_stale` при тайм-ауте
     §4.5, и причины разные. Литерал в этом месте был вторым источником
     истины: сообщение о тайм-ауте показывало бы текст про сбой обработки.
 
-    Пустая причина не оставляет человека без сообщения: §4.1 называет её
-    обязательной, но если её почему-то нет, молчание хуже общего текста.
+    Пустая причина не оставляет человека без сообщения: «понятную причину» и
+    кнопку повтора требует §4.5, но если причины почему-то нет, молчание хуже
+    общего текста.
+
+    `with_retry=False` — для отказа, который повтор не исправит (§3, тип без
+    адаптера): кнопка обещала бы исход, которого не будет.
+
+    Ссылка была на §4.1 в первой редакции. Это ошибка: фраза «переводится в
+    `failed` с понятной причиной; повторная обработка доступна кнопкой» стоит
+    в ТЗ один раз и относится к §4.5, а §4.1 перечисляет статусы и стадии.
+    Нашло ревью PR #59, и ошибка была не косметической — она же скрыла, что
+    путь тайм-аута остался без проверки кнопки.
     """
     async with session_scope(ctx["sessions"]) as session:
         reason = (

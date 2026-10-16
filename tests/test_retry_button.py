@@ -1,8 +1,10 @@
-"""Кнопка «Обработать заново». ТЗ §4.1, §4.5, §38 №8.
+"""Кнопка «Обработать заново». ТЗ §4.5, §38 №8.
 
-§4.1 требует её прямо: «материал переводится в `failed` с понятной причиной;
-повторная обработка доступна кнопкой». До этого модуля текст отказа обещал
-кнопку, которой не было ни в одном хендлере (Issue #44).
+§4.5 требует её прямо: «материал переводится в `failed` с понятной причиной;
+повторная обработка доступна кнопкой». Пункт именно §4.5 — в ТЗ эта фраза
+встречается один раз, в абзаце про тайм-аут ожидания; §4.1 перечисляет
+статусы. До этого модуля текст отказа обещал кнопку, которой не было ни в
+одном хендлере (Issue #44).
 """
 
 from __future__ import annotations
@@ -11,13 +13,18 @@ import datetime
 from unittest.mock import AsyncMock
 
 import pytest
-from aiogram.types import CallbackQuery, Chat, Message
+from aiogram.types import CallbackQuery, Chat, InaccessibleMessage, Message
 from aiogram.types import User as TgUser
 from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from bot.callbacks import Retry
-from bot.handlers.retry import ANSWER_RETRY, ANSWER_STALE, handle_retry, retry_keyboard
+from bot.callbacks import BIGINT_MAX, Retry, retry_keyboard
+from bot.handlers.retry import (
+    ANSWER_NO_WORKER,
+    ANSWER_RETRY,
+    ANSWER_STALE,
+    handle_retry,
+)
 from core.db.models import Material, User
 from core.db.session import session_scope
 from core.services.materials import MESSAGE_ID_KEY, progress_of
@@ -113,6 +120,27 @@ def test_keyboard_carries_the_material_in_callback_data() -> None:
     assert len(rows) == 1 and len(rows[0]) == 1
     assert rows[0][0].text == "Обработать заново"
     assert Retry.unpack(rows[0][0].callback_data or "").material_id == 77
+
+
+CALLBACK_DATA_LIMIT = 64
+"""Предел Telegram на `callback_data`, в байтах.
+
+Повторён числом, как в `tests/test_review_handlers.py`: предел задаёт
+платформа, и константы в коде под него нет — проверять его должен тест, а не
+надежда, потому что aiogram длину не контролирует.
+"""
+
+
+def test_callback_data_fits_the_telegram_limit() -> None:
+    """`callback_data` не длиннее 64 байт на предельном `material_id`.
+
+    Докстрока `bot/callbacks.py` этот предел называет, а проверяла его только
+    фабрика `Ans` — замечание ревью PR #59. На `BIGINT_MAX` пакет короткий,
+    запас большой, но проверяется он прогоном, а не рассуждением о длине.
+    """
+    packed = Retry(material_id=BIGINT_MAX).pack()
+
+    assert len(packed.encode("utf-8")) <= CALLBACK_DATA_LIMIT
 
 
 @pytest.mark.parametrize("data", ["r:0", "r:-1", "r:abc", "r:"])
@@ -224,18 +252,85 @@ async def test_retry_on_a_foreign_material_changes_nothing(
 
     Одинаковый ответ намеренно: разный выдавал бы факт существования чужого
     материала — утечка, которая ловилась в ревью WP-05 на оракуле ответа.
+
+    Ассерт стоит на **самом ответе**, а не только на отсутствии задачи.
+    Прежняя редакция смотрела лишь на `arq.jobs` и статусы, и мутация «чужому
+    существующему — свой текст, несуществующему — другой» оставляла набор
+    зелёным: свойство, объявленное в имени теста, не проверялось ничем
+    (ревью PR #59).
     """
     material_id = await _material(engine)
     stranger = await _material(engine, tg_id=STRANGER_TG)
     arq = FakeArq()
 
+    foreign = _callback(material_id, tg_id=STRANGER_TG)
+    missing = _callback(999_999, tg_id=STRANGER_TG)
+
     async with session_scope(sessions) as session:
-        await handle_retry(_callback(material_id, tg_id=STRANGER_TG), session, arq)
-        await handle_retry(_callback(999_999, tg_id=STRANGER_TG), session, arq)
+        await handle_retry(foreign, session, arq)
+        await handle_retry(missing, session, arq)
 
     assert arq.jobs == []
     assert (await _state(engine, material_id))[0] == "failed"
     assert (await _state(engine, stranger))[0] == "failed"
+
+    foreign.answer.assert_awaited_once_with(ANSWER_STALE, show_alert=True)  # type: ignore[attr-defined]
+    missing.answer.assert_awaited_once_with(ANSWER_STALE, show_alert=True)  # type: ignore[attr-defined]
+    assert (
+        foreign.answer.await_args == missing.answer.await_args  # type: ignore[attr-defined]
+    ), "ответы различаются — наблюдаемая разница выдаёт факт существования материала"
+
+
+async def test_retry_answers_honestly_when_there_is_no_worker(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+) -> None:
+    """Без пула ARQ человек слышит отказ, а не «обрабатываю заново».
+
+    Ветвь в продакшене недостижима — `bot/main.py` всегда строит пул, — но
+    ответ «обрабатываю» при материале в `processing`, который никто не
+    обрабатывает, обещал бы работу, которой не будет. Замечание ревью PR #59.
+    """
+    material_id = await _material(engine)
+    callback = _callback(material_id)
+
+    async with session_scope(sessions) as session:
+        await handle_retry(callback, session, None)
+
+    callback.answer.assert_awaited_once_with(  # type: ignore[attr-defined]
+        ANSWER_NO_WORKER, show_alert=True
+    )
+
+
+async def test_retry_survives_an_inaccessible_message(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+) -> None:
+    """Сообщение старше 48 часов приезжает `InaccessibleMessage` — и это не сбой.
+
+    У него нет ни `edit_text`, ни смысла правиться, но задача обязана уйти в
+    очередь: кнопка нажата человеком, который ждёт обработки, а не правки
+    текста. `message_id` при этом не запоминается — его неоткуда взять.
+    """
+    material_id = await _material(engine)
+    callback = _callback(material_id)
+    object.__setattr__(
+        callback,
+        "message",
+        InaccessibleMessage(message_id=0, chat=Chat(id=OWNER_TG, type="private")),
+    )
+    arq = FakeArq()
+
+    async with session_scope(sessions) as session:
+        await handle_retry(callback, session, arq)
+
+    assert arq.jobs == [("process_material_task", (material_id, "./data/materials/x.pdf"))]
+    callback.answer.assert_awaited_once_with(ANSWER_RETRY)  # type: ignore[attr-defined]
+
+    async with session_scope(sessions) as session:
+        assert MESSAGE_ID_KEY not in await progress_of(session, material_id)
 
 
 async def test_second_tap_does_not_enqueue_twice(
@@ -243,7 +338,12 @@ async def test_second_tap_does_not_enqueue_twice(
     sessions: async_sessionmaker[AsyncSession],
     clean_tables: None,
 ) -> None:
-    """Двойное нажатие даёт одну задачу: второе условие `UPDATE` не выполнится."""
+    """Двойное нажатие даёт одну задачу: второе условие `UPDATE` не выполнится.
+
+    Нажатия идут одно за другим в одной транзакции — это проверяет
+    идемпотентность по статусу, но **не** отсутствие окна между чтением и
+    записью: перекрытие транзакций нужно проверять отдельно.
+    """
     material_id = await _material(engine)
     arq = FakeArq()
 

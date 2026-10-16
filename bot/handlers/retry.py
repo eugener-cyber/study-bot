@@ -1,54 +1,58 @@
-"""Повторная обработка материала после отказа. ТЗ §4.1, §4.5.
+"""Повторная обработка материала после отказа. ТЗ §4.5, §35.
 
-§4.1 требует кнопку прямо: «материал переводится в `failed` с понятной
-причиной; **повторная обработка доступна кнопкой**». До этого модуля текст
-отказа обещал кнопку, которой не было ни в одном хендлере (Issue #44).
+§4.5 требует кнопку прямо: «материал переводится в `failed` с понятной
+причиной; **повторная обработка доступна кнопкой**». Пункт именно §4.5: в ТЗ
+эта фраза встречается один раз, в абзаце про тайм-аут ожидания. До этого
+модуля текст отказа обещал кнопку, которой не было ни в одном хендлере
+(Issue #44).
 
 Кнопка **возобновляет**, а не начинает заново. §4.2: «при исключении до COMMIT
 `completed_stages` не меняется, следующая попытка начинает стадию заново» —
 то есть пройденные стадии остаются пройденными, а повтор продолжает с
 упавшей. Сброс всего означал бы повторные вызовы модели по уже выполненным
 стадиям, то есть расход бюджета §6.3 без результата.
+
+§35: здесь только разбор апдейта, вызов сервиса и ответ. Переход статуса
+живёт в `core/services/materials.claim_failed_for_retry`, запись `message_id` —
+в `core/ingest/awaiting.remember_message`. Первая редакция выполняла и то и
+другое `update(Material)` прямо здесь, причём вторая половина повторяла
+существующий сервис строка в строку (ревью PR #59).
 """
 
 from __future__ import annotations
 
 from aiogram import Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CallbackQuery, Message
 from arq import ArqRedis
-from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.callbacks import Retry
-from core.db.models import Material, User
+from core.ingest.awaiting import remember_message
 from core.logging import get_logger
-from core.services.materials import MESSAGE_ID_KEY, progress_of
+from core.services.materials import claim_failed_for_retry
 
 log = get_logger(__name__)
 
 ANSWER_RETRY = "Обрабатываю заново."
 ANSWER_STALE = "Это сообщение устарело: материал уже обрабатывается или готов."
-ANSWER_FOREIGN = "Этот материал не ваш."
+"""Ответ на любой отказ — и на чужой материал, и на несуществующий.
+
+Один текст на все причины, а не «этот материал не ваш»: подставить чужой
+`material_id` в `callback_data` ничто не мешает, и разный ответ выдал бы факт
+существования материала. Отдельная константа под чужой материал в первой
+редакции лежала в модуле неиспользованной — мёртвый код, который к тому же
+создавал бы утечку, если бы его кто-нибудь применил (ревью PR #59).
+"""
+ANSWER_NO_WORKER = "Повтор не запущен: обработчик недоступен. Попробуйте позже."
+"""Воркера нет — и человек слышит об этом, а не «обрабатываю заново».
+
+Ветвь в продакшене недостижима (`bot/main.py` всегда строит пул), но ответ
+«обрабатываю» при материале в `processing`, который никто не обрабатывает,
+обещал бы работу, которой не будет: §4.1 такого состояния не предусматривает.
+`bot/handlers/upload.py` в той же ситуации отвечает честно — здесь так же.
+"""
 PROGRESS_TEXT = "Обрабатываю заново…"
-
-
-def retry_keyboard(material_id: int) -> InlineKeyboardMarkup:
-    """Кнопка под сообщением об отказе. §4.1.
-
-    Собирается здесь, а не в воркере: воркеру нужна разметка, но знать про
-    хендлеры он не должен — он импортирует только фабрику `callback_data`.
-    """
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Обработать заново",
-                    callback_data=Retry(material_id=material_id).pack(),
-                )
-            ]
-        ]
-    )
 
 
 async def handle_retry(
@@ -58,51 +62,29 @@ async def handle_retry(
 ) -> None:
     """Нажатие кнопки «Обработать заново».
 
-    **Право на действие выдаёт база**, а не проверка перед записью: условный
-    `UPDATE … WHERE status='failed' AND user_id=… RETURNING` либо меняет
-    строку, либо нет, и второй одновременный тап получает пустой результат.
-    Проверка «статус failed?» отдельным запросом оставила бы окно между
-    чтением и записью — при `READ COMMITTED` это ровно тот дефект, который
-    ловился в WP-05 на двойном нажатии ответа.
-
-    Владелец сверяется **в том же** `UPDATE`: подставить чужой `material_id`
-    в `callback_data` ничто не мешает, а отдельный запрос про владельца дал бы
-    разный наблюдаемый ответ для «чужого существующего» и «несуществующего»
-    материала — утечка факта существования, которая ловилась в ревью WP-05.
+    Право на действие выдаёт сервис одним условным `UPDATE` — там же, в его
+    докстроке, названо, почему проверка перед записью оставила бы окно между
+    чтением и записью и почему причина отказа наружу не возвращается.
     """
     data = Retry.unpack(callback.data or "")
     material_id = data.material_id
 
-    owner_tg_id = callback.from_user.id
-    claimed = (
-        await session.execute(
-            update(Material)
-            .where(
-                Material.id == material_id,
-                Material.status == "failed",
-                Material.user_id.in_(select(User.id).where(User.tg_id == owner_tg_id)),
-            )
-            .values(status="processing", error=None)
-            .returning(Material.id, Material.origin)
-        )
-    ).first()
+    origin = await claim_failed_for_retry(session, material_id, callback.from_user.id)
 
-    if claimed is None:
-        log.info("retry_rejected", material_id=material_id, user_id=owner_tg_id)
+    if origin is None:
         await callback.answer(ANSWER_STALE, show_alert=True)
         return
 
-    _, origin = claimed
-    source_path = str((origin or {}).get("path", ""))
-
+    source_path = str(origin.get("path", ""))
     message = await _refresh_message(callback, session, material_id)
 
-    if arq is not None:
-        await arq.enqueue_job("process_material_task", material_id, source_path)
-        log.info("retry_enqueued", material_id=material_id, message_id=message)
-    else:
-        log.info("retry_without_worker", material_id=material_id)
+    if arq is None:
+        log.warning("retry_without_worker", material_id=material_id)
+        await callback.answer(ANSWER_NO_WORKER, show_alert=True)
+        return
 
+    await arq.enqueue_job("process_material_task", material_id, source_path)
+    log.info("retry_enqueued", material_id=material_id, message_id=message)
     await callback.answer(ANSWER_RETRY)
 
 
@@ -115,6 +97,12 @@ async def _refresh_message(
     записи `message_id` прогресс следующей попытки снова оказался бы
     невидимым — ровно тот дефект, который этот тикет и исправлял в PR 1a.
 
+    `isinstance(message, Message)` сужает тип, а не `getattr` по имени поля:
+    у нажатия может приехать `InaccessibleMessage` (сообщение старше 48 часов
+    удалено на стороне Telegram), и у него нет ни `edit_text`, ни смысла
+    правиться. Первая редакция обходила это `getattr(..., None)`, то есть
+    проходила мимо `mypy --strict` без объяснения (п. 6 списка костылей).
+
     Гасится **только** ошибка API Telegram (`TelegramAPIError`): §4.5 про
     отображение, и падать из-за косметики, когда задача уже поставлена,
     значило бы показать человеку ошибку вместо начавшейся обработки. Широкий
@@ -122,27 +110,26 @@ async def _refresh_message(
     ошибку записи `message_id`, и опечатку в разметке.
     """
     message = callback.message
-    message_id = getattr(message, "message_id", None)
+    if not isinstance(message, Message):
+        log.info(
+            "retry_message_unavailable",
+            material_id=material_id,
+            message_type=type(message).__name__,
+        )
+        return None
 
-    if message_id is not None:
-        progress = await progress_of(session, material_id)
-        progress[MESSAGE_ID_KEY] = int(message_id)
-        await session.execute(
-            update(Material).where(Material.id == material_id).values(progress=progress)
+    await remember_message(session, material_id, message.message_id)
+
+    try:
+        await message.edit_text(PROGRESS_TEXT, reply_markup=None)
+    except TelegramAPIError as error:
+        log.info(
+            "retry_message_not_edited",
+            material_id=material_id,
+            error_type=type(error).__name__,
         )
 
-    edit = getattr(message, "edit_text", None)
-    if edit is not None:
-        try:
-            await edit(PROGRESS_TEXT, reply_markup=None)
-        except TelegramAPIError as error:
-            log.info(
-                "retry_message_not_edited",
-                material_id=material_id,
-                error_type=type(error).__name__,
-            )
-
-    return int(message_id) if message_id is not None else None
+    return message.message_id
 
 
 def build_retry_router(arq: ArqRedis | None = None) -> Router:
