@@ -15,9 +15,11 @@ from typing import Any
 import pytest
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import DeleteWebhook
+from aiogram.types import InlineKeyboardMarkup
 from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from bot.callbacks import Retry
 from core.adapters.pdf import VISION_PENDING_KEY, PdfAdapter
 from core.adapters.stub import StubAdapter
 from core.db.models import Material, User
@@ -294,6 +296,10 @@ async def test_failure_message_reaches_the_user(
 
     assert bot.edited, "сообщение об отказе не отправлено"
     assert "Обработать заново" in bot.edited[-1]
+    assert bot.targets[-1] == 555, f"правка ушла на сообщение {bot.targets[-1]}, а не на 555"
+    assert (
+        _retry_target(bot.keyboards[-1]) == material_id
+    ), "под отказом нет кнопки повтора этого материала — текст обещает её впустую"
 
     status, error = await _status_and_error(engine, material_id)
     assert status == "failed"
@@ -371,6 +377,7 @@ async def test_timeout_message_reaches_the_user_with_its_own_reason(
     assert expired == 1
     assert bot.edited, "сообщение о тайм-ауте не отправлено"
     assert "не получен ответ" in bot.edited[-1], f"показан не тот текст: {bot.edited[-1]!r}"
+    assert _retry_target(bot.keyboards[-1]) == material_id, "под тайм-аутом нет кнопки повтора"
 
 
 async def test_failure_without_a_progress_message_does_not_crash(
@@ -610,8 +617,10 @@ async def test_timeout_reaches_each_material_with_its_own_message(
         "question": "Обрабатывать?",
         "since": (NOW - datetime.timedelta(days=30)).isoformat(),
     }
+    expected: dict[int, int] = {}
     for tg_id, message_id in ((1503, 201), (1504, 202)):
         material_id = await _material(engine, tg_id=tg_id)
+        expected[message_id] = material_id
         async with session_scope(sessions) as session:
             await session.execute(
                 Material.__table__.update()
@@ -623,11 +632,30 @@ async def test_timeout_reaches_each_material_with_its_own_message(
     expired = await worker.expire_awaiting_task(_ctx(sessions, tmp_path) | {"bot": bot})
 
     assert expired == 2
-    assert len(bot.edited) == 2, f"сообщений {len(bot.edited)}, а материалов 2"
+    assert sorted(bot.targets) == [201, 202], f"правки ушли на {bot.targets}, а не на оба сообщения"
     assert all("не получен ответ" in text for text in bot.edited)
+    assert {
+        target: _retry_target(keyboard)
+        for target, keyboard in zip(bot.targets, bot.keyboards, strict=True)
+    } == expected, "кнопка под сообщением ведёт на чужой материал"
 
 
 # --- Сообщение о готовности называет пропущенные страницы (§6.3) ----------
+
+
+def _retry_target(keyboard: object) -> int | None:
+    """`material_id` из кнопки повтора, или `None`, если кнопки нет.
+
+    Ассерт «разметка не `None`» отличал бы кнопку от её отсутствия и не
+    отличал бы «у каждого своя» от «у всех кнопка первого материала». Поэтому
+    проверяется распакованное значение, а не факт наличия: мутация
+    `keyboard=None` в `_show_failed` до этого помощника оставляла весь набор
+    из 839 тестов зелёным (ревью PR #59).
+    """
+    if not isinstance(keyboard, InlineKeyboardMarkup):
+        return None
+    data = keyboard.inline_keyboard[0][0].callback_data or ""
+    return Retry.unpack(data).material_id
 
 
 class EditingBot:
@@ -642,9 +670,18 @@ class EditingBot:
         self.keyboards: list[object] = []
         """Разметка каждой правки.
 
-        Нужна тестам кнопки §4.1: проверять надо не «сообщение отправлено», а
-        «с кнопкой» и «без кнопки» — у отказа, который повтор не исправит,
-        кнопки быть не должно.
+        Нужна тестам кнопки §4.5: проверять надо не «сообщение отправлено», а
+        «с кнопкой этого материала» и «без кнопки» — у отказа, который повтор
+        не исправит, кнопки быть не должно.
+        """
+        self.targets: list[int] = []
+        """`message_id` каждой правки.
+
+        Без него тест «каждому материалу своё сообщение» не мог проверить
+        того, что объявлено его именем: двойник принимал `message_id` и
+        выбрасывал, все ассерты смотрели на число правок и текст, и
+        реализация, отправляющая оба сообщения на `message_id` первого
+        материала, оставалась бы зелёной (ревью PR #59).
         """
         self.error = error
         """Исключение, которое двойник бросает вместо записи.
@@ -666,6 +703,7 @@ class EditingBot:
             raise self.error
         self.edited.append(text)
         self.keyboards.append(reply_markup)
+        self.targets.append(message_id)
 
 
 async def _done_text(
