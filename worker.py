@@ -17,11 +17,12 @@ asyncio-цикле без второго рантайма».
 from __future__ import annotations
 
 import os
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Final
 
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
+from aiogram.exceptions import TelegramAPIError
 from arq import cron
 from arq.connections import RedisSettings
 from sqlalchemy import select
@@ -31,7 +32,7 @@ from bot.handlers.gate import gate_keyboard
 from bot.main import LOCAL_BOT_API
 from bot.progress import stage_text
 from core.adapters.base import SourceAdapter
-from core.adapters.factory import build_adapter
+from core.adapters.factory import AdapterNotReadyError, build_adapter
 from core.adapters.pdf import VISION_PENDING_KEY
 from core.adapters.stub import StubAdapter
 from core.config import Settings, load_settings
@@ -141,6 +142,17 @@ async def process_material_task(ctx: dict[str, Any], material_id: int, source_pa
         await _ask_user(ctx, material_id, awaiting.question)
         log.info("task_parked", material_id=material_id)
         return "awaiting_user"
+    except AdapterNotReadyError as error:
+        # Тип материала известен §3, но адаптера для него ещё нет. Кнопка
+        # «Обработать заново» здесь бессмысленна: повтор приведёт к тому же
+        # отказу, пока адаптер не приедет. Поэтому причина называется прямо, а
+        # кнопки нет (Issue #44). Различается **типом** исключения, а не
+        # разбором текста — разбор был бы п. 7 списка костылей.
+        log.info("task_unsupported_kind", material_id=material_id, kind=kind, error=str(error))
+        async with session_scope(sessions) as session:
+            await mark_failed(session, material_id, unsupported_kind_text(kind))
+        await _show_failed(ctx, material_id)
+        raise
     except Exception as error:
         log.error("task_failed", material_id=material_id, error_type=type(error).__name__)
         # `mark_failed` в СВОЕЙ транзакции: сбой случился в другой, и та уже
@@ -227,8 +239,18 @@ async def _edit_progress(ctx: dict[str, Any], material_id: int, text: str) -> bo
 
     try:
         await bot.edit_message_text(text=text, chat_id=int(chat_id), message_id=message_id)
-    except Exception:
-        log.info("progress_not_edited", material_id=material_id)
+    except TelegramAPIError as error:
+        # Гасится **только** ошибка API: §4.5 про отображение прогресса, и
+        # падать из-за косметики посреди обработки значило бы терять материал.
+        # Широкий `except Exception` был п. 4 списка костылей и успел это
+        # доказать: при добавлении `reply_markup` он молча проглотил
+        # несовпадение сигнатуры тест-двойника, и тесты показали «сообщение не
+        # отправлено» вместо ошибки вызова.
+        log.info(
+            "progress_not_edited",
+            material_id=material_id,
+            error_type=type(error).__name__,
+        )
         return False
     return True
 
@@ -270,6 +292,36 @@ async def _show_done(ctx: dict[str, Any], material_id: int) -> None:
         )
 
     await _edit_progress(ctx, material_id, text)
+
+
+UNSUPPORTED_KIND_TEXT: Final[dict[str, str]] = {
+    "image": "Фотографии и картинки пока не обрабатываются — я умею работать с PDF и текстом.",
+    "audio": "Голосовые и аудиофайлы пока не обрабатываются — я умею работать с PDF и текстом.",
+    "video": "Видео пока не обрабатывается — я умею работать с PDF и текстом.",
+}
+"""Что человек видит, когда адаптера для его материала ещё нет. §19.4 по духу.
+
+Отдельно от сообщения исключения намеренно. Текст `AdapterNotReadyError`
+называет пакет работ («приедет в WP-06 PR C2») — это нужно в журнале
+разработчику и бессмысленно человеку: номер пакета ему ничего не говорит, да
+ещё и устаревает при переносе работ. Ревью PR #58 поймало как раз показанный в
+чате внутренний идентификатор вместе с питоновскими кавычками вокруг типа.
+
+Тип материала (§3) здесь переведён на язык того, кто прислал файл:
+«фотографии», а не `image`.
+"""
+
+
+def unsupported_kind_text(kind: str) -> str:
+    """Человеческий текст отказа по типу материала.
+
+    Неизвестный тип даёт общую фразу, а не `KeyError`: новый тип в §3 появится
+    раньше, чем текст для него, и падать из-за отсутствующей строки в таблице
+    значило бы менять отказ обработки на сбой системы.
+    """
+    return UNSUPPORTED_KIND_TEXT.get(
+        kind, "Этот тип материала пока не обрабатывается — я умею работать с PDF и текстом."
+    )
 
 
 async def _show_failed(ctx: dict[str, Any], material_id: int) -> None:
