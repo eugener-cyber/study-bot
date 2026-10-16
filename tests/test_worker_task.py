@@ -448,6 +448,41 @@ async def test_task_refuses_a_kind_whose_adapter_has_not_arrived(
     assert (await _status_and_error(engine, material_id))[0] == "failed"
 
 
+def test_every_pending_kind_has_human_text() -> None:
+    """У каждого типа без адаптера есть текст для человека. Ревью PR #58.
+
+    `PENDING_KINDS` в фабрике и `UNSUPPORTED_KIND_TEXT` в воркере — две карты
+    одного соответствия, и вывести одну из другой нельзя: человеческая фраза
+    не выводится из имени типа §3. Поэтому полноту держит тест: новый тип в
+    `PENDING_KINDS` без строки здесь молча получал бы общую фразу, а урок
+    «две карты расходятся молча» в этом проекте уже стоил дефекта (PR #42,
+    расхождение `kind` между приёмом и фабрикой).
+    """
+    from core.adapters.factory import PENDING_KINDS
+    from worker import UNSUPPORTED_KIND_TEXT
+
+    missing = set(PENDING_KINDS) - set(UNSUPPORTED_KIND_TEXT)
+
+    assert not missing, f"типы без человеческого текста: {sorted(missing)}"
+
+
+def test_human_text_names_no_internal_identifier() -> None:
+    """Ни один текст не называет пакет работ и не печатает имя типа §3.
+
+    Внутренний идентификатор в чате — то, что ревью PR #58 и поймало:
+    человек видел «приедет в WP-06 PR C», да ещё и устаревшее.
+    """
+    from core.adapters.factory import PENDING_KINDS
+    from worker import UNSUPPORTED_KIND_TEXT
+
+    for kind, text in UNSUPPORTED_KIND_TEXT.items():
+        assert "WP-" not in text, f"{kind}: в тексте номер пакета — {text!r}"
+        assert kind not in text, f"{kind}: в тексте имя типа §3 — {text!r}"
+    assert set(UNSUPPORTED_KIND_TEXT) == set(
+        PENDING_KINDS
+    ), "карты разошлись: лишние или недостающие типы"
+
+
 # --- Сужение перехвата в _edit_progress (п. 4 списка костылей) ------------
 
 
@@ -552,6 +587,7 @@ async def test_unsupported_kind_fails_without_a_button(
     assert (
         "WP-" not in shown and "image" not in shown
     ), f"в чат ушёл внутренний идентификатор пакета или тип §3: {shown!r}"
+    assert bot.keyboards[-1] is None, "у отказа, который повтор не исправит, есть кнопка"
 
 
 async def test_timeout_reaches_each_material_with_its_own_message(
@@ -603,6 +639,13 @@ class EditingBot:
 
     def __init__(self, error: Exception | None = None) -> None:
         self.edited: list[str] = []
+        self.keyboards: list[object] = []
+        """Разметка каждой правки.
+
+        Нужна тестам кнопки §4.1: проверять надо не «сообщение отправлено», а
+        «с кнопкой» и «без кнопки» — у отказа, который повтор не исправит,
+        кнопки быть не должно.
+        """
         self.error = error
         """Исключение, которое двойник бросает вместо записи.
 
@@ -611,10 +654,18 @@ class EditingBot:
         `except Exception` оставляла все тесты зелёными (ревью PR #58).
         """
 
-    async def edit_message_text(self, *, text: str, chat_id: int, message_id: int) -> None:
+    async def edit_message_text(
+        self,
+        *,
+        text: str,
+        chat_id: int,
+        message_id: int,
+        reply_markup: object = None,
+    ) -> None:
         if self.error is not None:
             raise self.error
         self.edited.append(text)
+        self.keyboards.append(reply_markup)
 
 
 async def _done_text(

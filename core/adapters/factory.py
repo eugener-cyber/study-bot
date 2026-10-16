@@ -29,7 +29,13 @@ TEXT_KIND: Final = "text"
 """
 
 IMAGE_KIND: Final = "image"
-"""§5.3. Адаптер приедет в PR C пакета WP-06; тип уже пишется в базу при приёме."""
+"""§5.3. Адаптер приедет в PR C2 пакета WP-06; тип уже пишется в базу при приёме."""
+
+AUDIO_KIND: Final = "audio"
+"""§5.4. Адаптер приедет в WP-19."""
+
+VIDEO_KIND: Final = "video"
+"""§5.5. Адаптер приедет в WP-20."""
 
 BY_EXTENSION: Final[dict[str, str]] = {
     ".pdf": "pdf",
@@ -79,8 +85,8 @@ def known_kind_for_path(path: str) -> str | None:
 
 PENDING_KINDS: Final[dict[str, str]] = {
     IMAGE_KIND: "WP-06 PR C2",
-    "audio": "WP-19",
-    "video": "WP-20",
+    AUDIO_KIND: "WP-19",
+    VIDEO_KIND: "WP-20",
 }
 """Типы, которые §3 уже знает, а адаптера для них ещё нет — и в каком пакете он будет."""
 
