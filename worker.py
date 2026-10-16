@@ -273,10 +273,26 @@ async def _show_done(ctx: dict[str, Any], material_id: int) -> None:
 
 
 async def _show_failed(ctx: dict[str, Any], material_id: int) -> None:
+    """Показывает причину отказа, записанную в `materials.error` (§4.1).
+
+    Текст берётся из базы, а не из литерала здесь: его пишет тот, кто знает
+    причину — `mark_failed` при сбое стадии и `expire_stale` при тайм-ауте
+    §4.5, и причины разные. Литерал в этом месте был вторым источником
+    истины: сообщение о тайм-ауте показывало бы текст про сбой обработки.
+
+    Пустая причина не оставляет человека без сообщения: §4.1 называет её
+    обязательной, но если её почему-то нет, молчание хуже общего текста.
+    """
+    async with session_scope(ctx["sessions"]) as session:
+        reason = (
+            await session.execute(select(Material.error).where(Material.id == material_id))
+        ).scalar_one_or_none()
+
+    text = str(reason).strip() if reason else ""
     await _edit_progress(
         ctx,
         material_id,
-        "Не удалось обработать материал. Нажмите «Обработать заново».",
+        text or "Не удалось обработать материал. Нажмите «Обработать заново».",
     )
 
 
@@ -326,6 +342,16 @@ async def expire_awaiting_task(ctx: dict[str, Any]) -> int:
     settings: Settings = ctx["settings"]
     async with session_scope(ctx["sessions"]) as session:
         expired = await expire_stale(session, settings)
+
+    # §4.5 требует «понятную причину», и причина в базе была с самого начала —
+    # а сообщения не было: задача считала число и писала его в журнал.
+    # Человек видел сообщение «обрабатываю…» навсегда, потому что правку
+    # прогресса никто не делал. Issue #44, нашло ревью Плана.
+    for material_id in expired:
+        await _show_failed(ctx, material_id)
+
+    if expired:
+        log.info("awaiting_expired", count=len(expired), material_ids=expired)
     return len(expired)
 
 

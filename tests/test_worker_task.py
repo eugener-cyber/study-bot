@@ -255,6 +255,152 @@ async def test_progress_message_id_is_none_for_seeded_material(
         assert await progress_message_id(session, material_id) is None
 
 
+# --- Сообщение об отказе доходит до человека (§4.1, §4.5) -----------------
+
+
+async def test_failure_message_reaches_the_user(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Отказ показывается, а не только пишется в `materials.error`.
+
+    До правки `mark_failed` ставил `progress={}`, затирая `message_id`, а
+    `_show_failed` вызывается **после** него — и `_edit_progress`, не найдя
+    идентификатора, молча возвращал `False`. То есть сообщение об отказе не
+    доходило до человека вовсе, а тесты этого не ловили: они проверяли запись
+    в базу, то есть след, а не наблюдаемое поведение. Нашло ревью Плана
+    Issue #44.
+    """
+    import worker
+
+    material_id = await _material(engine, tg_id=1401)
+    async with session_scope(sessions) as session:
+        await remember_message(session, material_id, 555)
+
+    async def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("стадия сломалась")
+
+    monkeypatch.setattr(worker, "probe_and_gate", boom)
+
+    bot = EditingBot()
+    ctx = _ctx(sessions, tmp_path) | {"bot": bot}
+    with pytest.raises(RuntimeError):
+        await worker.process_material_task(ctx, material_id, "/tmp/none.md")
+
+    assert bot.edited, "сообщение об отказе не отправлено"
+    assert "Обработать заново" in bot.edited[-1]
+
+    status, error = await _status_and_error(engine, material_id)
+    assert status == "failed"
+    assert (
+        error is not None and error in bot.edited[-1]
+    ), "показан не тот текст, что записан в materials.error"
+
+
+async def test_failure_keeps_the_message_id_and_clears_the_rest(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+) -> None:
+    """`mark_failed` сохраняет `message_id` и затирает остальной прогресс.
+
+    Оба факта в одном тесте, и оба нужны: сохранение — чтобы сообщение было
+    куда отправить (§4.5 «одно сообщение»), затирание — чтобы остатки
+    ожидания прошлой попытки не выглядели ожиданием в следующей.
+    """
+    from core.services.materials import mark_failed, progress_of
+
+    material_id = await _material(engine, tg_id=1402)
+    async with session_scope(sessions) as session:
+        await park(session, material_id, kind="budget", question="Обрабатывать?")
+        await remember_message(session, material_id, 777)
+
+    async with session_scope(sessions) as session:
+        await mark_failed(session, material_id, "причина отказа")
+
+    async with session_scope(sessions) as session:
+        progress = await progress_of(session, material_id)
+
+    assert progress == {"message_id": 777}, f"прогресс после отказа: {progress}"
+
+
+async def test_timeout_message_reaches_the_user_with_its_own_reason(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """§4.5: тайм-аут ожидания показывает **свою** причину, а не текст сбоя.
+
+    До правки задача `expire_awaiting_task` только считала число и писала его
+    в журнал: материал уходил в `failed`, а человек продолжал видеть
+    «обрабатываю…» навсегда. Текст берётся из `materials.error`, поэтому
+    причина тайм-аута и причина сбоя не путаются — литерал в `_show_failed`
+    был вторым источником истины.
+    """
+    import worker
+
+    material_id = await _material(engine, tg_id=1403)
+    async with session_scope(sessions) as session:
+        await park(session, material_id, kind="budget", question="Обрабатывать?")
+        await remember_message(session, material_id, 888)
+        # Ожидание началось заведомо раньше тайм-аута.
+        await session.execute(
+            Material.__table__.update()
+            .where(Material.id == material_id)
+            .values(
+                progress={
+                    "stage": "awaiting_user",
+                    "kind": "budget",
+                    "question": "Обрабатывать?",
+                    "since": (NOW - datetime.timedelta(days=30)).isoformat(),
+                    "message_id": 888,
+                }
+            )
+        )
+
+    bot = EditingBot()
+    ctx = _ctx(sessions, tmp_path) | {"bot": bot}
+    expired = await worker.expire_awaiting_task(ctx)
+
+    assert expired == 1
+    assert bot.edited, "сообщение о тайм-ауте не отправлено"
+    assert "не получен ответ" in bot.edited[-1], f"показан не тот текст: {bot.edited[-1]!r}"
+
+
+async def test_failure_without_a_progress_message_does_not_crash(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Материал из `make seed` сообщения прогресса не имеет — и это не ошибка.
+
+    §4.5 про отображение прогресса в чате; материал, созданный консолью,
+    Telegram не касается вовсе, и падать из-за косметики нельзя.
+    """
+    import worker
+
+    material_id = await _material(engine, tg_id=1404)
+
+    async def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("стадия сломалась")
+
+    monkeypatch.setattr(worker, "probe_and_gate", boom)
+
+    bot = EditingBot()
+    ctx = _ctx(sessions, tmp_path) | {"bot": bot}
+    with pytest.raises(RuntimeError):
+        await worker.process_material_task(ctx, material_id, "/tmp/none.md")
+
+    assert bot.edited == [], "правка сообщения без message_id"
+    assert (await _status_and_error(engine, material_id))[0] == "failed"
+
+
 # --- Выбор адаптера по materials.kind (§3, §5.1) --------------------------
 
 
