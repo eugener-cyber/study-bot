@@ -17,7 +17,7 @@ asyncio-цикле без второго рантайма».
 from __future__ import annotations
 
 import os
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Final
 
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -148,13 +148,9 @@ async def process_material_task(ctx: dict[str, Any], material_id: int, source_pa
         # отказу, пока адаптер не приедет. Поэтому причина называется прямо, а
         # кнопки нет (Issue #44). Различается **типом** исключения, а не
         # разбором текста — разбор был бы п. 7 списка костылей.
-        log.info("task_unsupported_kind", material_id=material_id, error=str(error))
+        log.info("task_unsupported_kind", material_id=material_id, kind=kind, error=str(error))
         async with session_scope(sessions) as session:
-            await mark_failed(
-                session,
-                material_id,
-                f"Этот тип материала пока не поддерживается: {error}",
-            )
+            await mark_failed(session, material_id, unsupported_kind_text(kind))
         await _show_failed(ctx, material_id)
         raise
     except Exception as error:
@@ -298,9 +294,38 @@ async def _show_done(ctx: dict[str, Any], material_id: int) -> None:
     await _edit_progress(ctx, material_id, text)
 
 
-async def _show_failed(ctx: dict[str, Any], material_id: int, *, with_retry: bool = True) -> None:
-    """Показывает причину отказа, записанную в `materials.error` (§4.1).
+UNSUPPORTED_KIND_TEXT: Final[dict[str, str]] = {
+    "image": "Фотографии и картинки пока не обрабатываются — я умею работать с PDF и текстом.",
+    "audio": "Голосовые и аудиофайлы пока не обрабатываются — я умею работать с PDF и текстом.",
+    "video": "Видео пока не обрабатывается — я умею работать с PDF и текстом.",
+}
+"""Что человек видит, когда адаптера для его материала ещё нет. §19.4 по духу.
 
+Отдельно от сообщения исключения намеренно. Текст `AdapterNotReadyError`
+называет пакет работ («приедет в WP-06 PR C2») — это нужно в журнале
+разработчику и бессмысленно человеку: номер пакета ему ничего не говорит, да
+ещё и устаревает при переносе работ. Ревью PR #58 поймало как раз показанный в
+чате внутренний идентификатор вместе с питоновскими кавычками вокруг типа.
+
+Тип материала (§3) здесь переведён на язык того, кто прислал файл:
+«фотографии», а не `image`.
+"""
+
+
+def unsupported_kind_text(kind: str) -> str:
+    """Человеческий текст отказа по типу материала.
+
+    Неизвестный тип даёт общую фразу, а не `KeyError`: новый тип в §3 появится
+    раньше, чем текст для него, и падать из-за отсутствующей строки в таблице
+    значило бы менять отказ обработки на сбой системы.
+    """
+    return UNSUPPORTED_KIND_TEXT.get(
+        kind, "Этот тип материала пока не обрабатывается — я умею работать с PDF и текстом."
+    )
+
+
+async def _show_failed(ctx: dict[str, Any], material_id: int) -> None:
+    """Показывает причину отказа, записанную в `materials.error` (§4.1).
 
     Текст берётся из базы, а не из литерала здесь: его пишет тот, кто знает
     причину — `mark_failed` при сбое стадии и `expire_stale` при тайм-ауте

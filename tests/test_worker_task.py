@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import DeleteWebhook
 from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -446,6 +448,63 @@ async def test_task_refuses_a_kind_whose_adapter_has_not_arrived(
     assert (await _status_and_error(engine, material_id))[0] == "failed"
 
 
+# --- Сужение перехвата в _edit_progress (п. 4 списка костылей) ------------
+
+
+async def test_telegram_error_on_edit_is_swallowed(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """Ошибка API Telegram гасится: §4.5 про отображение, а не про обработку.
+
+    Сообщение могло быть удалено человеком, и падать из-за этого посреди
+    обработки значило бы терять материал из-за косметики.
+    """
+    import worker
+
+    material_id = await _material(engine, tg_id=1601)
+    async with session_scope(sessions) as session:
+        await remember_message(session, material_id, 301)
+
+    bot = EditingBot(
+        error=TelegramBadRequest(
+            method=DeleteWebhook(), message="Bad Request: message to edit not found"
+        )
+    )
+    ctx = _ctx(sessions, tmp_path) | {"bot": bot}
+
+    assert await worker._edit_progress(ctx, material_id, "текст") is False
+
+
+async def test_programming_error_on_edit_is_not_swallowed(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """А ошибка в коде наружу выходит. п. 4 списка костылей.
+
+    Это вторая половина, и без неё первая ничего не стоит: широкий
+    `except Exception` прошёл бы обе проверки. Он и успел навредить — при
+    добавлении `reply_markup` на соседней ветке молча проглотил несовпадение
+    сигнатуры тест-двойника, и тесты показали «сообщение не отправлено»
+    вместо ошибки вызова, то есть выдали ложный диагноз.
+    """
+    import worker
+
+    material_id = await _material(engine, tg_id=1602)
+    async with session_scope(sessions) as session:
+        await remember_message(session, material_id, 302)
+
+    bot = EditingBot(error=TypeError("неожиданный аргумент"))
+    ctx = _ctx(sessions, tmp_path) | {"bot": bot}
+
+    with pytest.raises(TypeError, match="неожиданный аргумент"):
+        await worker._edit_progress(ctx, material_id, "текст")
+
+
 # --- Неподдерживаемый тип и тайм-аут по нескольким материалам -------------
 
 
@@ -485,10 +544,14 @@ async def test_unsupported_kind_fails_without_a_button(
         )
 
     assert bot.edited, "сообщение не отправлено"
-    assert "пока не поддерживается" in bot.edited[-1]
+    shown = bot.edited[-1]
+    assert "Фотографии" in shown, f"текст не для человека: {shown!r}"
     assert (
-        "Обработать заново" not in bot.edited[-1]
+        "Обработать заново" not in shown
     ), "предложен повтор на отказе, который повтор не исправит"
+    assert (
+        "WP-" not in shown and "image" not in shown
+    ), f"в чат ушёл внутренний идентификатор пакета или тип §3: {shown!r}"
 
 
 async def test_timeout_reaches_each_material_with_its_own_message(
@@ -538,10 +601,19 @@ class EditingBot:
     не как aiogram доставляет правку.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, error: Exception | None = None) -> None:
         self.edited: list[str] = []
+        self.error = error
+        """Исключение, которое двойник бросает вместо записи.
+
+        Без него двойник не бросал никогда, и сужение перехвата в
+        `_edit_progress` не держалось ничем: мутация обратно к широкому
+        `except Exception` оставляла все тесты зелёными (ревью PR #58).
+        """
 
     async def edit_message_text(self, *, text: str, chat_id: int, message_id: int) -> None:
+        if self.error is not None:
+            raise self.error
         self.edited.append(text)
 
 

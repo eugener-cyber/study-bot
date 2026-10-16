@@ -78,7 +78,7 @@ def known_kind_for_path(path: str) -> str | None:
 
 
 PENDING_KINDS: Final[dict[str, str]] = {
-    IMAGE_KIND: "WP-06 PR C",
+    IMAGE_KIND: "WP-06 PR C2",
     "audio": "WP-19",
     "video": "WP-20",
 }
