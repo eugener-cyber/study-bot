@@ -446,6 +446,88 @@ async def test_task_refuses_a_kind_whose_adapter_has_not_arrived(
     assert (await _status_and_error(engine, material_id))[0] == "failed"
 
 
+# --- Неподдерживаемый тип и тайм-аут по нескольким материалам -------------
+
+
+async def test_unsupported_kind_fails_without_a_button(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """Тип без адаптера: причина названа, кнопки нет.
+
+    Повтор такого материала привёл бы к тому же отказу, пока адаптер не
+    приедет, — поэтому текст называет причину и **не** предлагает повтор.
+    Различается **типом** исключения (`AdapterNotReadyError`), а не разбором
+    текста сообщения: разбор был бы п. 7 списка костылей.
+
+    Кнопка приезжает следующим PR; здесь проверяется, что текст про повтор
+    этому отказу не достаётся.
+    """
+    import worker
+
+    material_id = await _material(engine, tg_id=1502)
+    async with engine.begin() as connection:
+        await connection.execute(
+            Material.__table__.update().where(Material.id == material_id).values(kind="image")
+        )
+        await connection.execute(
+            Material.__table__.update().where(Material.id == material_id).values(progress={})
+        )
+    async with session_scope(sessions) as session:
+        await remember_message(session, material_id, 102)
+
+    bot = EditingBot()
+    with pytest.raises(ValueError, match="WP-06 PR C"):
+        await worker.process_material_task(
+            _ctx(sessions, tmp_path) | {"bot": bot}, material_id, "/tmp/none.md"
+        )
+
+    assert bot.edited, "сообщение не отправлено"
+    assert "пока не поддерживается" in bot.edited[-1]
+    assert (
+        "Обработать заново" not in bot.edited[-1]
+    ), "предложен повтор на отказе, который повтор не исправит"
+
+
+async def test_timeout_reaches_each_material_with_its_own_message(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+    tmp_path: Path,
+) -> None:
+    """Два материала — два сообщения, каждому своё. Замечание ревью PR #57.
+
+    Один материал не отличал «у каждого свой `message_id`» от «взяли первый
+    попавшийся»: `expire_stale` переводит в `failed` несколько материалов за
+    раз, и отправка обязана идти по каждому.
+    """
+    import worker
+
+    stale = {
+        "stage": "awaiting_user",
+        "kind": "budget",
+        "question": "Обрабатывать?",
+        "since": (NOW - datetime.timedelta(days=30)).isoformat(),
+    }
+    for tg_id, message_id in ((1503, 201), (1504, 202)):
+        material_id = await _material(engine, tg_id=tg_id)
+        async with session_scope(sessions) as session:
+            await session.execute(
+                Material.__table__.update()
+                .where(Material.id == material_id)
+                .values(progress={**stale, "message_id": message_id})
+            )
+
+    bot = EditingBot()
+    expired = await worker.expire_awaiting_task(_ctx(sessions, tmp_path) | {"bot": bot})
+
+    assert expired == 2
+    assert len(bot.edited) == 2, f"сообщений {len(bot.edited)}, а материалов 2"
+    assert all("не получен ответ" in text for text in bot.edited)
+
+
 # --- Сообщение о готовности называет пропущенные страницы (§6.3) ----------
 
 

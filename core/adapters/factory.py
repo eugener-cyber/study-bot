@@ -85,6 +85,22 @@ PENDING_KINDS: Final[dict[str, str]] = {
 """Типы, которые §3 уже знает, а адаптера для них ещё нет — и в каком пакете он будет."""
 
 
+class AdapterNotReadyError(ValueError):
+    """Тип материала известен §3, но адаптера для него ещё нет.
+
+    Потомок `ValueError`, а не самостоятельный тип: вызывающие и тесты,
+    написанные до этого разделения, ловят `ValueError` и продолжают работать.
+    Отдельный тип нужен для одного решения — показывать ли кнопку «Обработать
+    заново»: нажимать её на материале, для которого адаптер ещё не приехал,
+    бессмысленно, а различать причины по тексту сообщения было бы п. 7 списка
+    костылей (Issue #44).
+
+    «Неизвестный тип материала» остаётся обычным `ValueError`: это ошибка
+    данных, а не отсутствие возможности, и кнопка повтора там уместна — после
+    исправления `materials.kind` повтор сработает.
+    """
+
+
 def build_adapter(kind: str, *, settings: Settings) -> SourceAdapter | None:
     """Адаптер для типа материала или `None`, если его разбирает не адаптер.
 
@@ -103,5 +119,7 @@ def build_adapter(kind: str, *, settings: Settings) -> SourceAdapter | None:
     if kind == TEXT_KIND:
         return None
     if kind in PENDING_KINDS:
-        raise ValueError(f"адаптер для материалов типа {kind!r} приедет в {PENDING_KINDS[kind]}")
+        raise AdapterNotReadyError(
+            f"адаптер для материалов типа {kind!r} приедет в {PENDING_KINDS[kind]}"
+        )
     raise ValueError(f"неизвестный тип материала: {kind!r}")
