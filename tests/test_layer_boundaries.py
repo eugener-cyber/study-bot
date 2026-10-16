@@ -225,3 +225,37 @@ async def test_default_assets_yields_nothing_and_is_an_iterator() -> None:
 
     assert hasattr(stream, "__anext__"), "метод вернул не асинхронный итератор"
     assert [item async for item in stream] == []
+
+
+WORKER = ROOT / "worker.py"
+
+WORKER_HANDLER_IMPORTS_ALLOWED = {"bot.handlers.gate"}
+"""Единственное исключение — клавиатура гейта §6.3, и у него есть тикет.
+
+Правило («фоновый процесс не импортирует разбор апдейтов») заведено ревью
+PR #59: воркер брал `retry_keyboard` из `bot/handlers/retry.py`, хотя условие
+approve Плана требовало обратного, а докстрока функции утверждала, что так и
+есть. Разметка повтора переехала в `bot/callbacks.py`, где воркеру нужен один
+`Retry`.
+
+`gate_keyboard` остаётся в своём хендлере: переносить его этим PR значило бы
+drive-by правку чужого кода (п. 3 чек-листа). Исключение названо перечнем, а
+не отсутствием правила, — иначе следующий импорт хендлера в воркер прошёл бы
+молча. Issue #60.
+"""
+
+
+def test_worker_does_not_import_update_handlers() -> None:
+    """§35, направление зависимости: воркер — не бот.
+
+    `bot.handlers.*` разбирает апдейты, фильтрует callback и рендерит ответы.
+    Фоновому процессу из этого нужна одна разметка, и она живёт рядом с
+    фабрикой `callback_data`. Перечень исключений — выше.
+    """
+    offending = {
+        name
+        for name in _imports(WORKER)
+        if name.startswith("bot.handlers") and name not in WORKER_HANDLER_IMPORTS_ALLOWED
+    }
+
+    assert not offending, f"worker.py импортирует хендлеры: {sorted(offending)}"

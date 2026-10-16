@@ -23,16 +23,24 @@ from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.exceptions import TelegramAPIError
+from aiogram.types import InlineKeyboardMarkup
 from arq import cron
 from arq.connections import RedisSettings
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from bot.callbacks import retry_keyboard
 from bot.handlers.gate import gate_keyboard
 from bot.main import LOCAL_BOT_API
 from bot.progress import stage_text
 from core.adapters.base import SourceAdapter
-from core.adapters.factory import AdapterNotReadyError, build_adapter
+from core.adapters.factory import (
+    AUDIO_KIND,
+    IMAGE_KIND,
+    VIDEO_KIND,
+    AdapterNotReadyError,
+    build_adapter,
+)
 from core.adapters.pdf import VISION_PENDING_KEY
 from core.adapters.stub import StubAdapter
 from core.config import Settings, load_settings
@@ -151,7 +159,7 @@ async def process_material_task(ctx: dict[str, Any], material_id: int, source_pa
         log.info("task_unsupported_kind", material_id=material_id, kind=kind, error=str(error))
         async with session_scope(sessions) as session:
             await mark_failed(session, material_id, unsupported_kind_text(kind))
-        await _show_failed(ctx, material_id)
+        await _show_failed(ctx, material_id, with_retry=False)
         raise
     except Exception as error:
         log.error("task_failed", material_id=material_id, error_type=type(error).__name__)
@@ -208,7 +216,13 @@ def fragments_from_text_or_stub(source_path: str) -> list[Any]:
     return []
 
 
-async def _edit_progress(ctx: dict[str, Any], material_id: int, text: str) -> bool:
+async def _edit_progress(
+    ctx: dict[str, Any],
+    material_id: int,
+    text: str,
+    *,
+    keyboard: InlineKeyboardMarkup | None = None,
+) -> bool:
     """Правит сообщение прогресса материала. Возвращает, получилось ли.
 
     Воркер правит **то же** сообщение, которое создал хендлер (§4.5: «одно
@@ -238,7 +252,12 @@ async def _edit_progress(ctx: dict[str, Any], material_id: int, text: str) -> bo
         return False
 
     try:
-        await bot.edit_message_text(text=text, chat_id=int(chat_id), message_id=message_id)
+        await bot.edit_message_text(
+            text=text,
+            chat_id=int(chat_id),
+            message_id=message_id,
+            reply_markup=keyboard,
+        )
     except TelegramAPIError as error:
         # Гасится **только** ошибка API: §4.5 про отображение прогресса, и
         # падать из-за косметики посреди обработки значило бы терять материал.
@@ -295,9 +314,9 @@ async def _show_done(ctx: dict[str, Any], material_id: int) -> None:
 
 
 UNSUPPORTED_KIND_TEXT: Final[dict[str, str]] = {
-    "image": "Фотографии и картинки пока не обрабатываются — я умею работать с PDF и текстом.",
-    "audio": "Голосовые и аудиофайлы пока не обрабатываются — я умею работать с PDF и текстом.",
-    "video": "Видео пока не обрабатывается — я умею работать с PDF и текстом.",
+    IMAGE_KIND: "Фотографии и картинки пока не обрабатываются — я умею работать с PDF и текстом.",
+    AUDIO_KIND: "Голосовые и аудиофайлы пока не обрабатываются — я умею работать с PDF и текстом.",
+    VIDEO_KIND: "Видео пока не обрабатывается — я умею работать с PDF и текстом.",
 }
 """Что человек видит, когда адаптера для его материала ещё нет. §19.4 по духу.
 
@@ -309,6 +328,14 @@ UNSUPPORTED_KIND_TEXT: Final[dict[str, str]] = {
 
 Тип материала (§3) здесь переведён на язык того, кто прислал файл:
 «фотографии», а не `image`.
+
+**Вторая карта того же соответствия**, и это названо прямо: `PENDING_KINDS`
+в фабрике перечисляет типы без адаптера, здесь — текст для каждого. Вывести
+один список из другого нельзя: человеческая фраза не выводится из имени типа.
+Поэтому ключи взяты из тех же констант, что в фабрике, а полноту держит тест
+`test_every_pending_kind_has_human_text` — без него новый тип в
+`PENDING_KINDS` молча получал бы общую фразу. Урок «две карты расходятся
+молча» записан в `STATE.md` после PR #42.
 """
 
 
@@ -324,16 +351,26 @@ def unsupported_kind_text(kind: str) -> str:
     )
 
 
-async def _show_failed(ctx: dict[str, Any], material_id: int) -> None:
-    """Показывает причину отказа, записанную в `materials.error` (§4.1).
+async def _show_failed(ctx: dict[str, Any], material_id: int, *, with_retry: bool = True) -> None:
+    """Показывает причину отказа, записанную в `materials.error` (§4.5).
 
     Текст берётся из базы, а не из литерала здесь: его пишет тот, кто знает
     причину — `mark_failed` при сбое стадии и `expire_stale` при тайм-ауте
     §4.5, и причины разные. Литерал в этом месте был вторым источником
     истины: сообщение о тайм-ауте показывало бы текст про сбой обработки.
 
-    Пустая причина не оставляет человека без сообщения: §4.1 называет её
-    обязательной, но если её почему-то нет, молчание хуже общего текста.
+    Пустая причина не оставляет человека без сообщения: «понятную причину» и
+    кнопку повтора требует §4.5, но если причины почему-то нет, молчание хуже
+    общего текста.
+
+    `with_retry=False` — для отказа, который повтор не исправит (§3, тип без
+    адаптера): кнопка обещала бы исход, которого не будет.
+
+    Ссылка была на §4.1 в первой редакции. Это ошибка: фраза «переводится в
+    `failed` с понятной причиной; повторная обработка доступна кнопкой» стоит
+    в ТЗ один раз и относится к §4.5, а §4.1 перечисляет статусы и стадии.
+    Нашло ревью PR #59, и ошибка была не косметической — она же скрыла, что
+    путь тайм-аута остался без проверки кнопки.
     """
     async with session_scope(ctx["sessions"]) as session:
         reason = (
@@ -345,6 +382,7 @@ async def _show_failed(ctx: dict[str, Any], material_id: int) -> None:
         ctx,
         material_id,
         text or "Не удалось обработать материал. Нажмите «Обработать заново».",
+        keyboard=retry_keyboard(material_id) if with_retry else None,
     )
 
 
